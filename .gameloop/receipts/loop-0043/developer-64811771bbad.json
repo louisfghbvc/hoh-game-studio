@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "role": "developer",
+  "loop_index": 43,
+  "timestamp": "2026-09-07T01:13:19Z",
+  "content_sha256": "64811771bbad",
+  "payload": {
+    "candidate_id": "loop-43-25c563317805",
+    "modified_paths": [
+      "game/scripts/player.gd",
+      "game/scenes/main.tscn"
+    ],
+    "summary": "Phase 5: Hit Sparks Particle VFX & Blood Splatter Effects"
+  }
+}
