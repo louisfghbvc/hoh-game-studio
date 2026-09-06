@@ -184,10 +184,22 @@ func add_soul(amount: float) -> void:
 func take_damage(amount: int, source_pos: Vector2 = Vector2.ZERO) -> void:
 	current_health = max(0, current_health - amount)
 	emit_signal("health_changed", current_health, max_health)
+	trigger_camera_shake(10.0)
+	trigger_hitstop(0.08)
 	if source_pos != Vector2.ZERO:
 		var knock_dir = (global_position - source_pos).normalized()
 		velocity.x = knock_dir.x * 280.0
 		velocity.y = -220.0
+
+func trigger_hitstop(duration: float = 0.06) -> void:
+	Engine.time_scale = 0.05
+	await get_tree().create_timer(duration, true, false, true).timeout
+	Engine.time_scale = 1.0
+
+func trigger_camera_shake(intensity: float = 6.0) -> void:
+	var cam = get_node_or_null("Camera2D")
+	if cam and cam.has_method("apply_shake"):
+		cam.apply_shake(intensity)
 
 func _handle_focus_healing(delta: float) -> void:
 	if current_health >= max_health or current_soul < 33.0:

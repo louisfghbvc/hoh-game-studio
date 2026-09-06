@@ -1,6 +1,7 @@
-[gd_scene load_steps=3 format=3 uid="uid://bplayer_void_knight_001"]
+[gd_scene load_steps=4 format=3 uid="uid://bplayer_void_knight_001"]
 
 [ext_resource type="Script" path="res://scripts/player.gd" id="1_player_script"]
+[ext_resource type="Script" path="res://scripts/camera_controller.gd" id="2_cam_script"]
 
 [sub_resource type="RectangleShape2D" id="RectangleShape2D_player"]
 size = Vector2(28, 48)
@@ -33,3 +34,4 @@ position = Vector2(0, -32)
 zoom = Vector2(1.5, 1.5)
 position_smoothing_enabled = true
 position_smoothing_speed = 8.0
+script = ExtResource("2_cam_script")
