@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 4,
+  "timestamp": "2026-09-07T00:44:11Z",
+  "content_sha256": "54706c0c8dd4",
+  "payload": {
+    "candidate_id": "loop-04-880e3b01c3d1",
+    "objective": "Implement Enemy Base AI (Crawler & Flying Vengefly)",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_4",
+        "title": "Implement Enemy Base AI (Crawler & Flying Vengefly)",
+        "status": "in_progress"
+      }
+    ]
+  }
+}

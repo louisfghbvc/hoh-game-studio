@@ -181,6 +181,14 @@ func add_soul(amount: float) -> void:
 	current_soul = min(max_soul, current_soul + amount)
 	emit_signal("soul_changed", current_soul, max_soul)
 
+func take_damage(amount: int, source_pos: Vector2 = Vector2.ZERO) -> void:
+	current_health = max(0, current_health - amount)
+	emit_signal("health_changed", current_health, max_health)
+	if source_pos != Vector2.ZERO:
+		var knock_dir = (global_position - source_pos).normalized()
+		velocity.x = knock_dir.x * 280.0
+		velocity.y = -220.0
+
 func _handle_focus_healing(delta: float) -> void:
 	if current_health >= max_health or current_soul < 33.0:
 		return

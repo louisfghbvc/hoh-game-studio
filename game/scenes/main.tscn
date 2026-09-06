@@ -1,11 +1,14 @@
-[gd_scene load_steps=3 format=3 uid="uid://bmain_void_knight_001"]
+[gd_scene load_steps=4 format=3 uid="uid://bmain_void_knight_001"]
 
 [ext_resource type="PackedScene" path="res://scenes/player.tscn" id="1_player_scene"]
+[ext_resource type="PackedScene" path="res://scenes/hud.tscn" id="2_hud_scene"]
 
 [sub_resource type="RectangleShape2D" id="RectangleShape2D_box"]
 size = Vector2(1000, 40)
 
 [node name="Main" type="Node2D"]
+
+[node name="HUD" parent="." instance=ExtResource("2_hud_scene")]
 
 [node name="Environment" type="Node2D" parent="."]
 
