@@ -1,0 +1,23 @@
+[gd_scene load_steps=3 format=3 uid="uid://bboss_door_void_knight_001"]
+
+[ext_resource type="Script" path="res://scripts/boss_arena_door.gd" id="1_door_script"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_door"]
+size = Vector2(20, 160)
+
+[node name="BossArenaDoor" type="StaticBody2D"]
+collision_layer = 1
+collision_mask = 2
+script = ExtResource("1_door_script")
+
+[node name="ColorRect" type="ColorRect" parent="."]
+visible = false
+offset_left = -10.0
+offset_top = -80.0
+offset_right = 10.0
+offset_bottom = 80.0
+color = Color(0.6, 0.2, 0.2, 0.95)
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="."]
+shape = SubResource("RectangleShape2D_door")
+disabled = true
