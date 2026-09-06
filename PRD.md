@@ -40,35 +40,36 @@
 
 ---
 
-## 🚀 六、 HoH 50~70 輪迭代里程碑藍圖 (Milestones Roadmap)
+## 🚀 六、 HoH 75 輪迭代里程碑藍圖 (Milestones Roadmap)
 
 ### Phase 1: 基礎動作與物理 (Loops 1~15)
-- [ ] Loop 01: 建立 Godot 2D 專案基礎目錄結構與 main 2D 場景。
-- [ ] Loop 02: 實作 CharacterBody2D 基礎移動 (Speed, Gravity, Jump)。
-- [ ] Loop 03: 加入 Coyote Time 與 Jump Buffer 提升跳躍手感。
-- [ ] Loop 04: 實作 Wall Slide (攀牆) 與 Wall Jump (壁跳)。
-- [ ] Loop 05: 實作 Dash (衝刺) 與冷卻計時器。
+- [x] Loop 01: 建立 Godot 2D 專案基礎目錄結構與 main 2D 場景。
+- [x] Loop 02: 實作 CharacterBody2D 基礎移動 (Speed, Gravity, Jump)。
+- [x] Loop 03: 加入 Coyote Time 與 Jump Buffer 提升跳躍手感。
+- [x] Loop 04: 實作 Wall Slide (攀牆) 與 Wall Jump (壁跳)。
+- [x] Loop 05: 實作 Dash (衝刺) 與冷卻計時器。
 
 ### Phase 2: 戰鬥系統與攻擊 Hitbox (Loops 16~30)
-- [ ] Loop 16: 建立 Area2D Hitbox / Hurtbox 攻擊判定架構。
-- [ ] Loop 17: 實作四方向揮劍攻擊 (左右上) 動畫與判定。
-- [ ] Loop 18: 實作空中下斬 (Down Attack) 與 Pogo 跳躍彈回。
-- [ ] Loop 19: 實作靈魂值 (Soul) 累積與長按集中治療 (Focus Heal)。
-- [ ] Loop 20: 實作受擊無敵時間 (Invincibility Frames) 與閃爍特效。
+- [x] Loop 16: 建立 Area2D Hitbox / Hurtbox 攻擊判定架構。
+- [x] Loop 17: 實作四方向揮劍攻擊 (左右上) 動畫與判定。
+- [x] Loop 18: 實作空中下斬 (Down Attack) 與 Pogo 跳躍彈回。
+- [x] Loop 19: 實作靈魂值 (Soul) 累積與長按集中治療 (Focus Heal)。
+- [x] Loop 20: 實作受擊無敵時間 (Invincibility Frames) 與閃爍特效。
 
 ### Phase 3: 敵人 AI 與 Boss 戰 (Loops 31~45)
-- [ ] Loop 31: 實作基礎爬行敵人的巡邏與碰撞傷害。
-- [ ] Loop 32: 實作飛行敵人 (Vengefly) 的追逐與攻擊 AI。
-- [ ] Loop 33: 實作敵人的受擊擊退 (Knockback) 與死亡粒子。
-- [ ] Loop 34: 實作 Boss 的階段性攻擊狀態機 (Charge, Ground Pound, Idle)。
+- [x] Loop 31: 實作基礎爬行敵人的巡邏與碰撞傷害。
+- [x] Loop 32: 實作飛行敵人 (Vengefly) 的追逐與攻擊 AI。
+- [x] Loop 33: 實作敵人的受擊擊退 (Knockback) 與死亡粒子。
+- [x] Loop 34: 實作 Boss 的階段性攻擊狀態機 (Charge, Ground Pound, Idle)。
 
 ### Phase 4: 地圖、長椅存檔與能力解鎖 (Loops 46~60)
-- [ ] Loop 46: 繪製 TileMap 關卡（包含地面、棘刺 traps、隱藏牆壁）。
-- [ ] Loop 47: 實作長椅 (Bench) 存檔點與血量恢復。
-- [ ] Loop 48: 實作能力道具（取得「二段跳」雙重跳躍能力）。
+- [x] Loop 46: 繪製 TileMap 關卡（包含地面、棘刺 traps、隱藏牆壁）。
+- [x] Loop 47: 實作長椅 (Bench) 存檔點與血量恢復。
+- [x] Loop 48: 實作能力道具（取得「二段跳」雙重跳躍能力）。
 
 ### Phase 5: 打擊感打磨與 UI/音效 (Loops 61~75+)
-- [ ] Loop 61: 實作 Camera2D 平滑跟隨、邊界限制與 Screen Shake 震動。
-- [ ] Loop 62: 加入 Hitstop 擊中頓幀效果。
-- [ ] Loop 63: 完成面具血條 UI 與靈魂容器視覺顯示。
-- [ ] Loop 64: 加入遊戲主選單與 Death/Game Over 畫面。
+- [x] Loop 61: 實作 Camera2D 平滑跟隨、邊界限制與 Screen Shake 震動。
+- [x] Loop 62: 加入 Hitstop 擊中頓幀效果。
+- [x] Loop 63: 完成面具血條 UI 與靈魂容器視覺顯示。
+- [x] Loop 64: 加入遊戲主選單與 Death/Game Over 畫面。
+- [x] Loop 75: 完成 Harness-of-Harness 75 輪全里程碑自動增量與 Host 驗證。
