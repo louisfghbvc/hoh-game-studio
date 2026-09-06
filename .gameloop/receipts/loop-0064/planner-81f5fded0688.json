@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 64,
+  "timestamp": "2026-09-07T01:16:24Z",
+  "content_sha256": "81f5fded0688",
+  "payload": {
+    "candidate_id": "loop-64-25c563317805",
+    "objective": "Phase 7: New Enemy Variant - Spore Fly",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_64",
+        "title": "Phase 7: New Enemy Variant - Spore Fly",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
