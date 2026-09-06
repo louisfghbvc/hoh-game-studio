@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 55,
+  "timestamp": "2026-09-07T01:15:05Z",
+  "content_sha256": "eab22cc34e95",
+  "payload": {
+    "candidate_id": "loop-55-25c563317805",
+    "objective": "Phase 6: Performance Optimization & Collision Layer Tuning",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_55",
+        "title": "Phase 6: Performance Optimization & Collision Layer Tuning",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
