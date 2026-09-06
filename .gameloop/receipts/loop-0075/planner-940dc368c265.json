@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 75,
+  "timestamp": "2026-09-07T01:18:01Z",
+  "content_sha256": "940dc368c265",
+  "payload": {
+    "candidate_id": "loop-75-25c563317805",
+    "objective": "Phase 7: Final Project Sign-off & Milestone Completion",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_75",
+        "title": "Phase 7: Final Project Sign-off & Milestone Completion",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
