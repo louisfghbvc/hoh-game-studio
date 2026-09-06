@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 61,
+  "timestamp": "2026-09-07T01:15:58Z",
+  "content_sha256": "7d6ae93fce2d",
+  "payload": {
+    "candidate_id": "loop-61-25c563317805",
+    "objective": "Phase 7: Metroidvania Map Expansion - Crystal Mines Region",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_61",
+        "title": "Phase 7: Metroidvania Map Expansion - Crystal Mines Region",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
