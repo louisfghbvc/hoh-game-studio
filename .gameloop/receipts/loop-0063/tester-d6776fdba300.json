@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "role": "tester",
+  "loop_index": 63,
+  "timestamp": "2026-09-07T01:16:24Z",
+  "content_sha256": "d6776fdba300",
+  "payload": {
+    "candidate_id": "loop-63-25c563317805",
+    "gate_verdict": "pass",
+    "checks": {
+      "clean_boot": {
+        "status": "pass",
+        "log": "Godot headless scan completed cleanly."
+      },
+      "player_controller_shell": {
+        "status": "pass",
+        "log": "Player node files exist and are valid."
+      }
+    }
+  }
+}
