@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 50,
+  "timestamp": "2026-09-07T01:14:21Z",
+  "content_sha256": "bfccbebeb1ea",
+  "payload": {
+    "candidate_id": "loop-50-25c563317805",
+    "objective": "Phase 5: Audio Manager BGM / SFX System",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_50",
+        "title": "Phase 5: Audio Manager BGM / SFX System",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
