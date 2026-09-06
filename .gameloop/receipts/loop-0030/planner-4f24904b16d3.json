@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 30,
+  "timestamp": "2026-09-07T01:11:25Z",
+  "content_sha256": "4f24904b16d3",
+  "payload": {
+    "candidate_id": "loop-30-25c563317805",
+    "objective": "Phase 3: Enemy Loot & Soul Vessel Rewards Balance",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_30",
+        "title": "Phase 3: Enemy Loot & Soul Vessel Rewards Balance",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
