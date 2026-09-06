@@ -16,6 +16,9 @@ class_name VoidPlayer
 @export var fall_gravity_scale: float = 1.5
 @export var coyote_time: float = 0.15
 @export var jump_buffer_time: float = 0.12
+@export var has_double_jump: bool = false
+@export var max_jumps: int = 1
+var jumps_left: int = 1
 
 # --- Wall Mechanics ---
 @export_group("Wall Mechanics")
@@ -106,11 +109,13 @@ func _physics_process(delta: float) -> void:
 	if is_on_wall and velocity.y > 0:
 		velocity.y = min(velocity.y, wall_slide_speed)
 
-	# Jump Execution (Normal & Coyote)
+	# Jump Execution (Normal, Coyote, Wall Jump & Double Jump)
 	if jump_buffer_timer > 0.0 and coyote_timer > 0.0:
 		_execute_jump()
 	elif jump_buffer_timer > 0.0 and is_on_wall:
 		_execute_wall_jump(input_dir)
+	elif jump_buffer_timer > 0.0 and not is_on_floor() and jumps_left > 0:
+		_execute_jump()
 
 	# Variable Jump Height (Cut jump short if released)
 	if Input.is_action_just_released("ui_accept") and velocity.y < 0.0:
@@ -139,6 +144,7 @@ func _execute_jump() -> void:
 	velocity.y = jump_velocity
 	coyote_timer = 0.0
 	jump_buffer_timer = 0.0
+	jumps_left -= 1
 
 func _execute_wall_jump(input_dir: float) -> void:
 	var wall_dir = get_wall_normal().x

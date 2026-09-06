@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "current_loop": 9,
-  "head_candidate": "loop-09-cf85df38fc46",
+  "current_loop": 12,
+  "head_candidate": "loop-12-3bc55cff964d",
   "candidates": {
     "loop-02-4b53a680c377": {
       "candidate_id": "loop-02-4b53a680c377",
@@ -58,6 +58,13 @@
       "role": "developer",
       "tree_sha256": "cf85df38fc46a1cbaf75976779e263663e1dcbaac52d4c98d4785f73a6dc0760",
       "git_commit": "c6084146951fde0f19cb0a29778e9066acfd3882"
+    },
+    "loop-12-3bc55cff964d": {
+      "candidate_id": "loop-12-3bc55cff964d",
+      "loop_index": 12,
+      "role": "developer",
+      "tree_sha256": "3bc55cff964d0e092527d1cf90161dd82610b6a8f04c8da59bbdfa1e2f852988",
+      "git_commit": "58f4809950d07edb3daf4812ab31088e0b3445e1"
     }
   }
 }

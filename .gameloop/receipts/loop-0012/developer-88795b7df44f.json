@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "role": "developer",
+  "loop_index": 12,
+  "timestamp": "2026-09-07T01:02:31Z",
+  "content_sha256": "88795b7df44f",
+  "payload": {
+    "candidate_id": "loop-12-3bc55cff964d",
+    "modified_paths": [
+      "game/scripts/player.gd",
+      "game/scenes/main.tscn"
+    ],
+    "summary": "Implement AbilityItem Pickup & Double Jump Mantis Wings Mechanics"
+  }
+}
