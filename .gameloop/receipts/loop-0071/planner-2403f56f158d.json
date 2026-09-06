@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 71,
+  "timestamp": "2026-09-07T01:17:26Z",
+  "content_sha256": "2403f56f158d",
+  "payload": {
+    "candidate_id": "loop-71-25c563317805",
+    "objective": "Phase 7: Final Polish - Particle Trail on Invincible Dash",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_71",
+        "title": "Phase 7: Final Polish - Particle Trail on Invincible Dash",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
