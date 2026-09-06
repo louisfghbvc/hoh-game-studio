@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 62,
+  "timestamp": "2026-09-07T01:16:07Z",
+  "content_sha256": "3d090b82fe0d",
+  "payload": {
+    "candidate_id": "loop-62-25c563317805",
+    "objective": "Phase 7: Metroidvania Map Expansion - Forgotten Grounds Region",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_62",
+        "title": "Phase 7: Metroidvania Map Expansion - Forgotten Grounds Region",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
