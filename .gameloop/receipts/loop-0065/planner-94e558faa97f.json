@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 65,
+  "timestamp": "2026-09-07T01:16:33Z",
+  "content_sha256": "94e558faa97f",
+  "payload": {
+    "candidate_id": "loop-65-25c563317805",
+    "objective": "Phase 7: Boss 2: Crystal Guardian Phase 1 & Beam Attacks",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_65",
+        "title": "Phase 7: Boss 2: Crystal Guardian Phase 1 & Beam Attacks",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
