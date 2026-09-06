@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 3,
+  "timestamp": "2026-09-07T00:32:23Z",
+  "content_sha256": "2a68727d34dc",
+  "payload": {
+    "candidate_id": "loop-03-4b53a680c377",
+    "objective": "Implement Pogo Jump and Down Attack Mechanics",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_3",
+        "title": "Implement Pogo Jump and Down Attack Mechanics",
+        "status": "in_progress"
+      }
+    ]
+  }
+}

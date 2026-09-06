@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "summary": {
+    "open": 0,
+    "closed": 0,
+    "regressed": 0,
+    "blocked": 0
+  },
+  "issues": []
+}
