@@ -21,6 +21,13 @@ func take_damage(amount: int, source_position: Vector2 = Vector2.ZERO) -> void:
 	current_health -= amount
 	emit_signal("enemy_damaged", current_health)
 	
+	# Spawn Hit Sparks Particle Effect (Loop 10)
+	var sparks_scene = preload("res://scenes/hit_sparks.tscn")
+	if sparks_scene:
+		var sparks = sparks_scene.instantiate()
+		get_parent().add_child(sparks)
+		sparks.global_position = global_position
+	
 	# Apply Knockback
 	if source_position != Vector2.ZERO:
 		var knock_dir = (global_position - source_position).normalized()
