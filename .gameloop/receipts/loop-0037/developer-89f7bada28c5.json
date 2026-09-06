@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "role": "developer",
+  "loop_index": 37,
+  "timestamp": "2026-09-07T01:12:27Z",
+  "content_sha256": "89f7bada28c5",
+  "payload": {
+    "candidate_id": "loop-37-25c563317805",
+    "modified_paths": [
+      "game/scripts/player.gd",
+      "game/scenes/main.tscn"
+    ],
+    "summary": "Phase 4: Keycard Doors & Inventory Item Gating"
+  }
+}
