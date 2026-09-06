@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 40,
+  "timestamp": "2026-09-07T01:12:53Z",
+  "content_sha256": "564b9f46ac97",
+  "payload": {
+    "candidate_id": "loop-40-25c563317805",
+    "objective": "Phase 4: Scene Transition Portals & Door Triggers",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_40",
+        "title": "Phase 4: Scene Transition Portals & Door Triggers",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
