@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 26,
+  "timestamp": "2026-09-07T01:10:49Z",
+  "content_sha256": "09605f4d4b1c",
+  "payload": {
+    "candidate_id": "loop-26-25c563317805",
+    "objective": "Phase 3: Boss Shockwave Attack & Projectile Trajectory",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_26",
+        "title": "Phase 3: Boss Shockwave Attack & Projectile Trajectory",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
