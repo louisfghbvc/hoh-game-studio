@@ -1,15 +1,19 @@
-[gd_scene load_steps=6 format=3 uid="uid://bmain_void_knight_001"]
+[gd_scene load_steps=10 format=3 uid="uid://bmain_void_knight_001"]
 
 [ext_resource type="PackedScene" path="res://scenes/player.tscn" id="1_player_scene"]
 [ext_resource type="PackedScene" path="res://scenes/hud.tscn" id="2_hud_scene"]
 [ext_resource type="PackedScene" path="res://scenes/minimap_ui.tscn" id="3_minimap_scene"]
 [ext_resource type="PackedScene" path="res://scenes/pause_menu.tscn" id="4_pause_scene"]
 [ext_resource type="PackedScene" path="res://scenes/scene_transition.tscn" id="5_trans_scene"]
+[ext_resource type="PackedScene" path="res://scenes/parallax_background.tscn" id="6_bg_scene"]
+[ext_resource type="PackedScene" path="res://scenes/shielded_sentry.tscn" id="7_sentry_scene"]
 
 [sub_resource type="RectangleShape2D" id="RectangleShape2D_box"]
 size = Vector2(1000, 40)
 
 [node name="Main" type="Node2D"]
+
+[node name="ParallaxBackground" parent="." instance=ExtResource("6_bg_scene")]
 
 [node name="HUD" parent="." instance=ExtResource("2_hud_scene")]
 
@@ -19,6 +23,9 @@ size = Vector2(1000, 40)
 
 [node name="SceneTransitionDoor" parent="." instance=ExtResource("5_trans_scene")]
 position = Vector2(1050, 430)
+
+[node name="ShieldedSentry" parent="." instance=ExtResource("7_sentry_scene")]
+position = Vector2(750, 480)
 
 [node name="Environment" type="Node2D" parent="."]
 

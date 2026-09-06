@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 22,
+  "timestamp": "2026-09-07T01:10:12Z",
+  "content_sha256": "adf5e21a6e74",
+  "payload": {
+    "candidate_id": "loop-22-395f4ab6d2c3",
+    "objective": "Phase 3: Shielded Sentry Enemy & Frontal Shield Defense",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_22",
+        "title": "Phase 3: Shielded Sentry Enemy & Frontal Shield Defense",
+        "status": "in_progress"
+      }
+    ]
+  }
+}

@@ -91,7 +91,12 @@ class VCSManager:
     def merge_to_main(self, loop_id: int):
         """Merges gameloop branch into main branch upon QA Tester final approval."""
         subprocess.run(["git", "checkout", "main"], cwd=self.workspace_dir, capture_output=True)
-        subprocess.run(["git", "merge", "gameloop", "-m", f"release(loop-{loop_id:04d}): QA Approved Release"], cwd=self.workspace_dir, capture_output=True)
+        res = subprocess.run(["git", "merge", "gameloop", "--no-ff", "-m", f"release(loop-{loop_id:04d}): QA Approved Release"], cwd=self.workspace_dir, capture_output=True)
+        if res.returncode != 0:
+            # Resolve any conflict by taking gameloop version
+            subprocess.run(["git", "checkout", "--theirs", "."], cwd=self.workspace_dir, capture_output=True)
+            subprocess.run(["git", "add", "."], cwd=self.workspace_dir, capture_output=True)
+            subprocess.run(["git", "commit", "-m", f"release(loop-{loop_id:04d}): QA Approved Release"], cwd=self.workspace_dir, capture_output=True)
         subprocess.run(["git", "checkout", "gameloop"], cwd=self.workspace_dir, capture_output=True)
 
     def rollback_to_commit(self, commit_hash: str):

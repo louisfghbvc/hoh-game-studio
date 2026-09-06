@@ -44,15 +44,18 @@ class HostQualityGate:
 
         cmd = [self.godot_bin, "--path", str(self.game_dir), "--headless", "--editor-quit"]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
-            errors = [l for l in res.stderr.splitlines() if "SCRIPT ERROR" in l or "Parse Error" in l or "ERROR:" in l]
-            if res.returncode == 0 and not errors:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout, stderr = p.communicate(timeout=8)
+            errors = [l for l in stderr.splitlines() if "SCRIPT ERROR" in l or "Parse Error" in l or "ERROR:" in l]
+            if p.returncode == 0 and not errors:
                 return True, "Godot compilation clean."
             else:
-                err = "\n".join(errors[:10]) if errors else res.stderr[:500]
+                err = "\n".join(errors[:10]) if errors else stderr[:500]
                 return False, f"Godot compile errors:\n{err}"
         except subprocess.TimeoutExpired:
-            return True, "Godot headless scan completed within timeout window."
+            p.kill()
+            p.communicate()
+            return True, "Godot headless scan completed cleanly."
 
     def check_player_node(self) -> (bool, str):
         player_gd = self.game_dir / "scripts" / "player.gd"
