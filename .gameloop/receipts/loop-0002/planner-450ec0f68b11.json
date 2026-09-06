@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 2,
+  "timestamp": "2026-09-07T00:40:43Z",
+  "content_sha256": "450ec0f68b11",
+  "payload": {
+    "candidate_id": "loop-02-f1424eb0cb6e",
+    "objective": "Implement 4-Directional Sword Slash Attack Mechanics",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_2",
+        "title": "Implement 4-Directional Sword Slash Attack Mechanics",
+        "status": "in_progress"
+      }
+    ]
+  }
+}

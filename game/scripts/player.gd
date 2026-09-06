@@ -11,6 +11,7 @@ class_name VoidPlayer
 # --- Jump & Gravity ---
 @export_group("Jump")
 @export var jump_velocity: float = -520.0
+@export var pogo_velocity: float = -480.0
 @export var gravity_scale: float = 1.0
 @export var fall_gravity_scale: float = 1.5
 @export var coyote_time: float = 0.15
@@ -27,23 +28,50 @@ class_name VoidPlayer
 @export var dash_duration: float = 0.18
 @export var dash_cooldown: float = 0.5
 
-# --- State Timers ---
+# --- Combat & Health (Loop 2 & Loop 3) ---
+@export_group("Combat & Health")
+@export var max_health: int = 5
+@export var current_health: int = 5
+@export var max_soul: float = 100.0
+@export var current_soul: float = 0.0
+@export var attack_cooldown: float = 0.25
+@export var attack_duration: float = 0.15
+
+# --- State Variables ---
 var coyote_timer: float = 0.0
 var jump_buffer_timer: float = 0.0
 var dash_cooldown_timer: float = 0.0
 var dash_timer: float = 0.0
+var attack_cooldown_timer: float = 0.0
+var attack_timer: float = 0.0
+var focus_heal_timer: float = 0.0
+
 var is_dashing: bool = false
+var is_attacking: bool = false
+var is_focusing: bool = false
+var attack_direction: Vector2 = Vector2.RIGHT
 var facing_direction: int = 1
 
 # Gravity reference
 var gravity: float = ProjectSettings.get_setting("physics/2d/default_gravity", 980.0)
 
-@onready var sprite: ColorRect = $ColorRect if has_node("ColorRect") else null
+# Node references
+@onready var slash_effect: ColorRect = $SlashVisual if has_node("SlashVisual") else null
+
+signal health_changed(new_hp, max_hp)
+signal soul_changed(new_soul, max_soul)
 
 func _physics_process(delta: float) -> void:
 	# Update timers
 	_update_timers(delta)
 	
+	# Handle Focus Healing (Hold Q / A key)
+	if Input.is_key_pressed(KEY_Q) or Input.is_key_pressed(KEY_A):
+		_handle_focus_healing(delta)
+	else:
+		is_focusing = false
+		focus_heal_timer = 0.0
+
 	# Handle Dash Movement
 	if is_dashing:
 		velocity.x = facing_direction * dash_speed
@@ -100,6 +128,11 @@ func _physics_process(delta: float) -> void:
 		if dash_cooldown_timer <= 0.0 and not is_dashing:
 			_start_dash()
 
+	# Attack Execution (Loop 2: 4-Directional Slash / Loop 3: Down Attack Pogo)
+	if (Input.is_key_pressed(KEY_J) or Input.is_key_pressed(KEY_Z) or Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)):
+		if attack_cooldown_timer <= 0.0 and not is_attacking:
+			_execute_attack()
+
 	move_and_slide()
 
 func _execute_jump() -> void:
@@ -118,10 +151,73 @@ func _start_dash() -> void:
 	dash_timer = dash_duration
 	dash_cooldown_timer = dash_cooldown
 
+func _execute_attack() -> void:
+	is_attacking = true
+	attack_timer = attack_duration
+	attack_cooldown_timer = attack_cooldown
+	
+	# Determine Direction (Up, Down in air, or Facing Forward)
+	var up_pressed = Input.is_key_pressed(KEY_W) or Input.is_action_pressed("ui_up")
+	var down_pressed = Input.is_key_pressed(KEY_S) or Input.is_action_pressed("ui_down")
+	
+	if up_pressed:
+		attack_direction = Vector2.UP
+	elif down_pressed and not is_on_floor():
+		attack_direction = Vector2.DOWN
+		# Trigger Pogo Jump if hitting ground/hazard below!
+		_trigger_pogo_bounce()
+	else:
+		attack_direction = Vector2.RIGHT if facing_direction > 0 else Vector2.LEFT
+		
+	_visualize_slash(attack_direction)
+	# Add Soul on attack hit (Loop 3 mechanic)
+	add_soul(11.0)
+
+func _trigger_pogo_bounce() -> void:
+	velocity.y = pogo_velocity
+	coyote_timer = coyote_time
+
+func add_soul(amount: float) -> void:
+	current_soul = min(max_soul, current_soul + amount)
+	emit_signal("soul_changed", current_soul, max_soul)
+
+func _handle_focus_healing(delta: float) -> void:
+	if current_health >= max_health or current_soul < 33.0:
+		return
+	is_focusing = true
+	focus_heal_timer += delta
+	if focus_heal_timer >= 0.8: # Hold for 0.8s to heal 1 HP
+		current_soul -= 33.0
+		current_health = min(max_health, current_health + 1)
+		focus_heal_timer = 0.0
+		emit_signal("health_changed", current_health, max_health)
+		emit_signal("soul_changed", current_soul, max_soul)
+
+func _visualize_slash(dir: Vector2) -> void:
+	if slash_effect:
+		slash_effect.visible = true
+		if dir == Vector2.UP:
+			slash_effect.position = Vector2(-24, -80)
+			slash_effect.size = Vector2(48, 20)
+		elif dir == Vector2.DOWN:
+			slash_effect.position = Vector2(-24, 0)
+			slash_effect.size = Vector2(48, 20)
+		else:
+			slash_effect.position = Vector2(16 if dir.x > 0 else -40, -36)
+			slash_effect.size = Vector2(24, 32)
+
 func _update_timers(delta: float) -> void:
 	if dash_cooldown_timer > 0.0:
 		dash_cooldown_timer -= delta
+	if attack_cooldown_timer > 0.0:
+		attack_cooldown_timer -= delta
 	if is_dashing:
 		dash_timer -= delta
 		if dash_timer <= 0.0:
 			is_dashing = false
+	if is_attacking:
+		attack_timer -= delta
+		if attack_timer <= 0.0:
+			is_attacking = false
+			if slash_effect:
+				slash_effect.visible = false
