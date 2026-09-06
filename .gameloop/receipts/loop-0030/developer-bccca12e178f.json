@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "role": "developer",
+  "loop_index": 30,
+  "timestamp": "2026-09-07T01:11:25Z",
+  "content_sha256": "bccca12e178f",
+  "payload": {
+    "candidate_id": "loop-30-25c563317805",
+    "modified_paths": [
+      "game/scripts/player.gd",
+      "game/scenes/main.tscn"
+    ],
+    "summary": "Phase 3: Enemy Loot & Soul Vessel Rewards Balance"
+  }
+}
