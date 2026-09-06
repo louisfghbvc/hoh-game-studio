@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 47,
+  "timestamp": "2026-09-07T01:13:54Z",
+  "content_sha256": "f7ff080d69b8",
+  "payload": {
+    "candidate_id": "loop-47-25c563317805",
+    "objective": "Phase 5: ESC Pause Menu & Game Audio Controls",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_47",
+        "title": "Phase 5: ESC Pause Menu & Game Audio Controls",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
