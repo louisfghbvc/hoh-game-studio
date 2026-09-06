@@ -55,6 +55,8 @@ var is_focusing: bool = false
 var attack_direction: Vector2 = Vector2.RIGHT
 var facing_direction: int = 1
 
+var inventory_keys: Array[String] = []
+
 # Gravity reference
 var gravity: float = ProjectSettings.get_setting("physics/2d/default_gravity", 980.0)
 
@@ -176,8 +178,43 @@ func _execute_attack() -> void:
 		attack_direction = Vector2.RIGHT if facing_direction > 0 else Vector2.LEFT
 		
 	_visualize_slash(attack_direction)
+	_perform_attack_hit_check(attack_direction)
 	# Add Soul on attack hit (Loop 3 mechanic)
 	add_soul(11.0)
+
+func _perform_attack_hit_check(dir: Vector2) -> void:
+	var space_state = get_world_2d().direct_space_state
+	var query = PhysicsShapeQueryParameters2D.new()
+	var box = RectangleShape2D.new()
+	if dir == Vector2.UP:
+		box.size = Vector2(48, 30)
+		query.transform = Transform2D(0, global_position + Vector2(0, -60))
+	elif dir == Vector2.DOWN:
+		box.size = Vector2(48, 30)
+		query.transform = Transform2D(0, global_position + Vector2(0, 10))
+	else:
+		box.size = Vector2(36, 40)
+		query.transform = Transform2D(0, global_position + Vector2(28 * facing_direction, -24))
+	query.shape = box
+	query.collide_with_bodies = true
+	query.collide_with_areas = true
+	query.collision_mask = 0xFFFFFFFF
+	
+	var results = space_state.intersect_shape(query, 16)
+	for res in results:
+		var collider = res.get("collider")
+		if collider and collider != self:
+			if collider.has_method("take_damage"):
+				collider.take_damage(1, global_position)
+			elif collider.get_parent() and collider.get_parent().has_method("take_damage"):
+				collider.get_parent().take_damage(1, global_position)
+
+func add_key(key_id: String) -> void:
+	if not inventory_keys.has(key_id):
+		inventory_keys.append(key_id)
+
+func has_key(key_id: String) -> bool:
+	return inventory_keys.has(key_id)
 
 func _trigger_pogo_bounce() -> void:
 	velocity.y = pogo_velocity

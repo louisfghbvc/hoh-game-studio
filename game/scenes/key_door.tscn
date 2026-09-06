@@ -1,0 +1,31 @@
+[gd_scene load_steps=4 format=3 uid="uid://bkey_door_001"]
+
+[ext_resource type="Script" path="res://scripts/key_door.gd" id="1_door_script"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_door"]
+size = Vector2(24, 96)
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_interact"]
+size = Vector2(64, 96)
+
+[node name="KeyDoor" type="StaticBody2D"]
+collision_layer = 1
+collision_mask = 3
+script = ExtResource("1_door_script")
+
+[node name="ColorRect" type="ColorRect" parent="."]
+offset_left = -12.0
+offset_top = -48.0
+offset_right = 12.0
+offset_bottom = 48.0
+color = Color(0.8, 0.6, 0.1, 1.0)
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="."]
+shape = SubResource("RectangleShape2D_door")
+
+[node name="InteractionArea" type="Area2D" parent="."]
+collision_layer = 0
+collision_mask = 2
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="InteractionArea"]
+shape = SubResource("RectangleShape2D_interact")

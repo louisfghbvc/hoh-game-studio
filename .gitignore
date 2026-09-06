@@ -1,3 +1,5 @@
 .godot/
 *.tmp
 *.log
+build/
+

@@ -1,8 +1,11 @@
-[gd_scene load_steps=5 format=3 uid="uid://bcaverns_void_knight_001"]
+[gd_scene load_steps=8 format=3 uid="uid://bcaverns_void_knight_001"]
 
 [ext_resource type="PackedScene" path="res://scenes/player.tscn" id="1_player_scene"]
 [ext_resource type="PackedScene" path="res://scenes/hud.tscn" id="2_hud_scene"]
 [ext_resource type="PackedScene" path="res://scenes/ability_item.tscn" id="3_ability_scene"]
+[ext_resource type="PackedScene" path="res://scenes/breakable_wall.tscn" id="4_wall_scene"]
+[ext_resource type="PackedScene" path="res://scenes/key_item.tscn" id="5_key_scene"]
+[ext_resource type="PackedScene" path="res://scenes/key_door.tscn" id="6_door_scene"]
 
 [sub_resource type="RectangleShape2D" id="RectangleShape2D_cavern_box"]
 size = Vector2(1400, 40)
@@ -45,6 +48,15 @@ shape = SubResource("RectangleShape2D_cavern_box")
 
 [node name="AbilityItem" parent="." instance=ExtResource("3_ability_scene")]
 position = Vector2(500, 280)
+
+[node name="BreakableWall" parent="." instance=ExtResource("4_wall_scene")]
+position = Vector2(850, 450)
+
+[node name="KeyItem" parent="." instance=ExtResource("5_key_scene")]
+position = Vector2(920, 470)
+
+[node name="KeyDoor" parent="." instance=ExtResource("6_door_scene")]
+position = Vector2(1100, 450)
 
 [node name="Player" parent="." instance=ExtResource("1_player_scene")]
 position = Vector2(150, 450)
