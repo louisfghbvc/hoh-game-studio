@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 45,
+  "timestamp": "2026-09-07T01:13:37Z",
+  "content_sha256": "f989d3ff5b6a",
+  "payload": {
+    "candidate_id": "loop-45-25c563317805",
+    "objective": "Phase 5: Soul Vessel Gauge UI & Pulse Animation",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_45",
+        "title": "Phase 5: Soul Vessel Gauge UI & Pulse Animation",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
