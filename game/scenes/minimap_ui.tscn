@@ -1,0 +1,50 @@
+[gd_scene load_steps=2 format=3 uid="uid://bminimap_void_knight_001"]
+
+[ext_resource type="Script" path="res://scripts/minimap_ui.gd" id="1_minimap_script"]
+
+[node name="MinimapUI" type="Control"]
+layout_mode = 3
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -220.0
+offset_top = 20.0
+offset_right = -20.0
+offset_bottom = 90.0
+grow_horizontal = 0
+script = ExtResource("1_minimap_script")
+
+[node name="Panel" type="Panel" parent="."]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="LocationLabel" type="Label" parent="Panel"]
+layout_mode = 1
+anchors_preset = 10
+anchor_right = 1.0
+offset_left = 10.0
+offset_top = 8.0
+offset_right = -10.0
+offset_bottom = 32.0
+grow_horizontal = 2
+theme_override_font_sizes/font_size = 14
+text = "ZONE: ANCIENT RUINS"
+
+[node name="CoordsLabel" type="Label" parent="Panel"]
+layout_mode = 1
+anchors_preset = 12
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 10.0
+offset_top = -32.0
+offset_right = -10.0
+offset_bottom = -8.0
+grow_horizontal = 2
+grow_vertical = 0
+theme_override_font_sizes/font_size = 12
+text = "POS: (300, 450)"

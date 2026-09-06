@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 16,
+  "timestamp": "2026-09-07T01:04:11Z",
+  "content_sha256": "9c3dcd912592",
+  "payload": {
+    "candidate_id": "loop-16-55f32fe3bf92",
+    "objective": "Implement SceneTransitionDoor Map Zone Travel Portal",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_16",
+        "title": "Implement SceneTransitionDoor Map Zone Travel Portal",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
