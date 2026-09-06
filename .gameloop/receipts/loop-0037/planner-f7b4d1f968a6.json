@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 37,
+  "timestamp": "2026-09-07T01:12:27Z",
+  "content_sha256": "f7b4d1f968a6",
+  "payload": {
+    "candidate_id": "loop-37-25c563317805",
+    "objective": "Phase 4: Keycard Doors & Inventory Item Gating",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_37",
+        "title": "Phase 4: Keycard Doors & Inventory Item Gating",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
