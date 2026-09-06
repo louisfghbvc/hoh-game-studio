@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 25,
+  "timestamp": "2026-09-07T01:10:41Z",
+  "content_sha256": "e1160f3f04cb",
+  "payload": {
+    "candidate_id": "loop-25-25c563317805",
+    "objective": "Phase 3: Boss False Knight Telegraphing & Phase Transition",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_25",
+        "title": "Phase 3: Boss False Knight Telegraphing & Phase Transition",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
