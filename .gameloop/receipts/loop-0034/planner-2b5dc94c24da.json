@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 34,
+  "timestamp": "2026-09-07T01:12:00Z",
+  "content_sha256": "2b5dc94c24da",
+  "payload": {
+    "candidate_id": "loop-34-25c563317805",
+    "objective": "Phase 4: Secret Breakable Walls & Secret Ledges",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_34",
+        "title": "Phase 4: Secret Breakable Walls & Secret Ledges",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
