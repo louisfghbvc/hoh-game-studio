@@ -1,24 +1,91 @@
 {
   "schema_version": 1,
-  "default_bookmark": "main",
-  "development_bookmark": "gameloop",
-  "game_name": "VoidKnight",
-  "game_source_root": "game",
-  "push_policy": "host_gate_pass_to_development_branch;qa_pass_to_main",
-  "roles": {
-    "planner": "gameloop-planner-bot[bot] <planner@hoh.local>",
-    "developer": "gameloop-developer-bot[bot] <developer@hoh.local>",
-    "tester": "gameloop-tester-bot[bot] <tester@hoh.local>"
-  },
-  "current_loop": 22,
-  "head_candidate": "loop-22-395f4ab6d2c3",
+  "current_loop": 23,
+  "head_candidate": "loop-23-25c563317805",
   "candidates": {
-    "loop-22-395f4ab6d2c3": {
-      "candidate_id": "loop-22-395f4ab6d2c3",
+    "loop-02-4b53a680c377": {
+      "candidate_id": "loop-02-4b53a680c377",
+      "loop_index": 2,
+      "role": "developer",
+      "tree_sha256": "4b53a680c37716d647a0a0d13d9fd944cb3481b72b05e030224f6f9fb310819f",
+      "git_commit": "a48e568c34c83890685b390104115b230e4d9ae6"
+    },
+    "loop-03-4b53a680c377": {
+      "candidate_id": "loop-03-4b53a680c377",
+      "loop_index": 3,
+      "role": "developer",
+      "tree_sha256": "4b53a680c37716d647a0a0d13d9fd944cb3481b72b05e030224f6f9fb310819f",
+      "git_commit": "a48e568c34c83890685b390104115b230e4d9ae6"
+    },
+    "loop-02-f1424eb0cb6e": {
+      "candidate_id": "loop-02-f1424eb0cb6e",
+      "loop_index": 2,
+      "role": "developer",
+      "tree_sha256": "f1424eb0cb6e4ecb22dd1f9eed21e20273dbf2cefe912d6aa7a4d66027e03d96",
+      "git_commit": "e8585de2ff058c39265e3fb39f4f1ed3be1bbfed"
+    },
+    "loop-04-880e3b01c3d1": {
+      "candidate_id": "loop-04-880e3b01c3d1",
+      "loop_index": 4,
+      "role": "developer",
+      "tree_sha256": "880e3b01c3d121b39b4872146a242a84f5ee280bcb7daa78ba4ee55c7ec40384",
+      "git_commit": "0798b693fa287d0725ac7fec267007a587231818"
+    },
+    "loop-06-98aaa28e377a": {
+      "candidate_id": "loop-06-98aaa28e377a",
+      "loop_index": 6,
+      "role": "developer",
+      "tree_sha256": "98aaa28e377af609f61b9c868c64fd9bcb9d0a6ab03a7d77d05596510237f191",
+      "git_commit": "a5ac3625327d7d05d1ee50789dd0b5104a73256b"
+    },
+    "loop-08-d32c6999ad0d": {
+      "candidate_id": "loop-08-d32c6999ad0d",
+      "loop_index": 8,
+      "role": "developer",
+      "tree_sha256": "d32c6999ad0d9f7a66966dfcd678c9ae92bfc7df474e2f52cb0a2fa25cdb26cf",
+      "git_commit": "b8522d4b501ff8bda70691ddf99047a8e855a921"
+    },
+    "loop-08-968288179106": {
+      "candidate_id": "loop-08-968288179106",
+      "loop_index": 8,
+      "role": "developer",
+      "tree_sha256": "9682881791063e47da95378a2c028bd51250b42d63704d81932f4ef392228ea5",
+      "git_commit": "ac271c86eedf4243a2a98c1612975df5843713a2"
+    },
+    "loop-09-cf85df38fc46": {
+      "candidate_id": "loop-09-cf85df38fc46",
+      "loop_index": 9,
+      "role": "developer",
+      "tree_sha256": "cf85df38fc46a1cbaf75976779e263663e1dcbaac52d4c98d4785f73a6dc0760",
+      "git_commit": "c6084146951fde0f19cb0a29778e9066acfd3882"
+    },
+    "loop-12-3bc55cff964d": {
+      "candidate_id": "loop-12-3bc55cff964d",
+      "loop_index": 12,
+      "role": "developer",
+      "tree_sha256": "3bc55cff964d0e092527d1cf90161dd82610b6a8f04c8da59bbdfa1e2f852988",
+      "git_commit": "58f4809950d07edb3daf4812ab31088e0b3445e1"
+    },
+    "loop-16-55f32fe3bf92": {
+      "candidate_id": "loop-16-55f32fe3bf92",
+      "loop_index": 16,
+      "role": "developer",
+      "tree_sha256": "55f32fe3bf92787d4c841cabbc282d9e6fc289f3120854ef726e003dd6cbf770",
+      "git_commit": "abfc113d295cede23e7bb1cdf807a0be8515555e"
+    },
+    "loop-22-25c563317805": {
+      "candidate_id": "loop-22-25c563317805",
       "loop_index": 22,
       "role": "developer",
-      "tree_sha256": "395f4ab6d2c3f83b06368a3401b45e762cef3ca258606c3097e9c7a7daac4e2c",
-      "git_commit": "694015be2a7864ccc6be7f272bea7cd6a3501478"
+      "tree_sha256": "25c5633178059afb244d412bde22c264c9ee19f56f7330a5e032c1bf0420b8a7",
+      "git_commit": "3b1cbff101ce1f26a4e7539c1e3cdcf7b6a8e69d"
+    },
+    "loop-23-25c563317805": {
+      "candidate_id": "loop-23-25c563317805",
+      "loop_index": 23,
+      "role": "developer",
+      "tree_sha256": "25c5633178059afb244d412bde22c264c9ee19f56f7330a5e032c1bf0420b8a7",
+      "git_commit": "fdd2785eeb615a6c71fdb282fd60a84231135075"
     }
   }
 }
