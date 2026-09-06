@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 63,
+  "timestamp": "2026-09-07T01:16:15Z",
+  "content_sha256": "467b50ae186f",
+  "payload": {
+    "candidate_id": "loop-63-25c563317805",
+    "objective": "Phase 7: New Enemy Variant - Crystal Crawler",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_63",
+        "title": "Phase 7: New Enemy Variant - Crystal Crawler",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
