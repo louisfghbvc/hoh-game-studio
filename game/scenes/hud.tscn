@@ -5,22 +5,107 @@
 [node name="HUD" type="CanvasLayer"]
 script = ExtResource("1_hud_script")
 
-[node name="MarginContainer" type="MarginContainer" parent="."]
-offset_left = 20.0
+[node name="Control" type="Control" parent="."]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="TopLeftFrame" type="HBoxContainer" parent="Control"]
+layout_mode = 0
+offset_left = 24.0
 offset_top = 20.0
-offset_right = 300.0
-offset_bottom = 100.0
+offset_right = 380.0
+offset_bottom = 90.0
+theme_override_constants/separation = 16
 
-[node name="VBoxContainer" type="VBoxContainer" parent="MarginContainer"]
+[node name="SoulVesselFrame" type="Control" parent="Control/TopLeftFrame"]
+custom_minimum_size = Vector2(56, 56)
 layout_mode = 2
 
-[node name="HealthLabel" type="Label" parent="MarginContainer/VBoxContainer"]
-layout_mode = 2
-theme_override_font_sizes/font_size = 22
-text = "MASKS: 🤍 🤍 🤍 🤍 🤍"
+[node name="SoulBg" type="ColorRect" parent="Control/TopLeftFrame/SoulVesselFrame"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0.08, 0.1, 0.15, 0.9)
 
-[node name="SoulBar" type="ProgressBar" parent="MarginContainer/VBoxContainer"]
-custom_minimum_size = Vector2(200, 16)
+[node name="SoulFill" type="ColorRect" parent="Control/TopLeftFrame/SoulVesselFrame"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+color = Color(0.2, 0.8, 1.0, 0.85)
+
+[node name="SoulPercentLabel" type="Label" parent="Control/TopLeftFrame/SoulVesselFrame"]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_font_sizes/font_size = 11
+text = "0%"
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="VBoxContainer" type="VBoxContainer" parent="Control/TopLeftFrame"]
 layout_mode = 2
-value = 0.0
-show_percentage = false
+alignment = 1
+
+[node name="TitleLabel" type="Label" parent="Control/TopLeftFrame/VBoxContainer"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.8, 0.85, 0.95, 1)
+theme_override_font_sizes/font_size = 12
+text = "MASKS & SOUL VESSEL"
+
+[node name="MasksContainer" type="HBoxContainer" parent="Control/TopLeftFrame/VBoxContainer"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="TopRightFrame" type="PanelContainer" parent="Control"]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -300.0
+offset_top = 20.0
+offset_right = -20.0
+offset_bottom = 60.0
+grow_horizontal = 0
+
+[node name="InventoryLabel" type="Label" parent="Control/TopRightFrame"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.9, 0.85, 0.4, 1)
+theme_override_font_sizes/font_size = 13
+text = "ITEMS: 🗡️ Sword | 🎒 Ancient Key"
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="BottomControlsLegend" type="PanelContainer" parent="Control"]
+layout_mode = 1
+anchors_preset = 7
+anchor_left = 0.5
+anchor_top = 1.0
+anchor_left = 0.5
+anchor_top = 1.0
+offset_left = -360.0
+offset_top = -44.0
+offset_right = 360.0
+offset_bottom = -12.0
+grow_horizontal = 2
+grow_vertical = 0
+
+[node name="LegendLabel" type="Label" parent="Control/BottomControlsLegend"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.85, 0.9, 0.95, 0.9)
+theme_override_font_sizes/font_size = 12
+text = "[A/D] Move  │  [Space] Jump / Wall Jump  │  [Shift] Dash  │  [J/Z] Attack  │  [Hold J] Focus Heal  │  [M] Map"
+horizontal_alignment = 1
+vertical_alignment = 1
