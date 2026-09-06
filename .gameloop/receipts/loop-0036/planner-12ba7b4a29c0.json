@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 36,
+  "timestamp": "2026-09-07T01:12:18Z",
+  "content_sha256": "12ba7b4a29c0",
+  "payload": {
+    "candidate_id": "loop-36-25c563317805",
+    "objective": "Phase 4: Bench Rest Healing & Animation Reset",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_36",
+        "title": "Phase 4: Bench Rest Healing & Animation Reset",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
