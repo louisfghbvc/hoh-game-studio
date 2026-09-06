@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "role": "developer",
+  "loop_index": 67,
+  "timestamp": "2026-09-07T01:16:51Z",
+  "content_sha256": "6978f76458cf",
+  "payload": {
+    "candidate_id": "loop-67-25c563317805",
+    "modified_paths": [
+      "game/scripts/player.gd",
+      "game/scenes/main.tscn"
+    ],
+    "summary": "Phase 7: Super Dash (Crystal Heart) Charged Ability"
+  }
+}

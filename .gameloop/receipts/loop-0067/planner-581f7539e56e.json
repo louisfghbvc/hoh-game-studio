@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 67,
+  "timestamp": "2026-09-07T01:16:51Z",
+  "content_sha256": "581f7539e56e",
+  "payload": {
+    "candidate_id": "loop-67-25c563317805",
+    "objective": "Phase 7: Super Dash (Crystal Heart) Charged Ability",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_67",
+        "title": "Phase 7: Super Dash (Crystal Heart) Charged Ability",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
