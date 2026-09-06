@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 29,
+  "timestamp": "2026-09-07T01:11:17Z",
+  "content_sha256": "afc5cece8aef",
+  "payload": {
+    "candidate_id": "loop-29-25c563317805",
+    "objective": "Phase 3: Boss Arena Locking Doors Integration",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_29",
+        "title": "Phase 3: Boss Arena Locking Doors Integration",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
