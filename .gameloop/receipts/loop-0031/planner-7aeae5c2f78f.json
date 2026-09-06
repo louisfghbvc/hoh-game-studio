@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 31,
+  "timestamp": "2026-09-07T01:11:34Z",
+  "content_sha256": "7aeae5c2f78f",
+  "payload": {
+    "candidate_id": "loop-31-25c563317805",
+    "objective": "Phase 4: Ancient Ruins Level Geometry & Wall Jump Routes",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_31",
+        "title": "Phase 4: Ancient Ruins Level Geometry & Wall Jump Routes",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
