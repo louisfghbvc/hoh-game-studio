@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "role": "planner",
+  "loop_index": 42,
+  "timestamp": "2026-09-07T01:13:10Z",
+  "content_sha256": "23cea52174ed",
+  "payload": {
+    "candidate_id": "loop-42-25c563317805",
+    "objective": "Phase 5: Camera Screen Shake Impulse & Hitstop Freeze Frame",
+    "open_issues": 0,
+    "tasks": [
+      {
+        "id": "task:loop_42",
+        "title": "Phase 5: Camera Screen Shake Impulse & Hitstop Freeze Frame",
+        "status": "in_progress"
+      }
+    ]
+  }
+}
