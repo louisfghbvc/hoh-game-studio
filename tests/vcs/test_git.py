@@ -136,6 +136,55 @@ def test_landing_prepared_candidate_rejects_an_unexpected_direct_child(
     assert (repo / "product.txt").read_text(encoding="utf-8") == "intended"
 
 
+def test_prepare_candidate_rejects_repository_mutations_outside_literal_set(
+    tmp_path: Path,
+) -> None:
+    repo = initialized_repo(tmp_path)
+    git = GitService(repo)
+    git.create_run_branch("run-abc")
+    (repo / "product.txt").write_text("intended", encoding="utf-8")
+    (repo / "injected.txt").write_text("must not be committed", encoding="utf-8")
+
+    with pytest.raises(GitError, match="mutation|path|candidate"):
+        git.prepare_candidate(1, "bounded candidate", ("product.txt",))
+
+
+def test_prepare_candidate_handles_deletion_and_literal_special_character_path(
+    tmp_path: Path,
+) -> None:
+    repo = initialized_repo(tmp_path)
+    special = repo / "feature[1].txt"
+    deleted = repo / "delete-me.txt"
+    deleted.write_text("remove me", encoding="utf-8")
+    run_git(repo, "add", "delete-me.txt")
+    run_git(
+        repo,
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-m",
+        "add deletion fixture",
+    )
+    git = GitService(repo)
+    git.create_run_branch("run-abc")
+    deleted.unlink()
+    special.write_text("literal path", encoding="utf-8")
+
+    prepared = git.prepare_candidate(
+        1,
+        "literal candidate",
+        ("delete-me.txt", "feature[1].txt"),
+    )
+    git.land_prepared_commit(prepared)
+
+    committed = run_git(repo, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+    assert "delete-me.txt" not in committed
+    assert "feature[1].txt" in committed
+    assert run_git(repo, "show", "HEAD:feature[1].txt") == "literal path"
+
+
 def test_candidate_commit_is_rejected_on_the_default_branch(tmp_path: Path) -> None:
     repo = initialized_repo(tmp_path)
     (repo / "product.txt").write_text("changed", encoding="utf-8")

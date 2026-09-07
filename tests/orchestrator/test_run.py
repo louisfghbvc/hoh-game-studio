@@ -720,6 +720,42 @@ def test_evidence_commit_excludes_raw_role_response_scratch_files(tmp_path: Path
     assert not any(path.startswith(response_root + "/") for path in tracked.splitlines())
 
 
+def test_evidence_commit_ignores_raw_jsonl_and_named_lookalike_scratch(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+
+    def qa_with_product_scratch(request):
+        loop_dir = next(
+            (project / ".hoh" / "runs").glob("*/loops/loop-0001")
+        )
+        (loop_dir / "raw-agent-output.jsonl").write_text(
+            '{"untrusted": true}\n', encoding="utf-8"
+        )
+        lookalike = loop_dir / "responses" / "evidence.json"
+        lookalike.parent.mkdir(parents=True)
+        lookalike.write_text('{"lookalike": true}\n', encoding="utf-8")
+        return qa_response(request)
+
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_with_product_scratch),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+
+    result = services.orchestrator.run(max_loops=1)
+
+    loop_prefix = f".hoh/runs/{result['run_id']}/loops/loop-0001"
+    committed = run_git(project, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+    assert f"{loop_prefix}/raw-agent-output.jsonl" not in committed
+    assert f"{loop_prefix}/responses/evidence.json" not in committed
+    assert (project / loop_prefix / "raw-agent-output.jsonl").is_file()
+    assert (project / loop_prefix / "responses" / "evidence.json").is_file()
+
+
 def test_completion_snapshot_has_distinct_candidate_bound_check_identities(
     tmp_path: Path,
 ) -> None:

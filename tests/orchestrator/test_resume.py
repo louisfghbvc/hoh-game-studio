@@ -170,6 +170,74 @@ def test_resume_rejects_candidate_with_expected_tree_but_wrong_identity(
     assert backend.requests == []
 
 
+def test_resume_rejects_extra_product_path_injected_after_development_journal(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    prepare = services.git.prepare_candidate
+    services.git.prepare_candidate = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("crash after development journal")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="development journal"):
+        services.orchestrator.run(max_loops=1)
+    services.git.prepare_candidate = prepare  # type: ignore[method-assign]
+    backend.requests.clear()
+    (project / "injected-after-development.txt").write_text(
+        "external mutation\n", encoding="utf-8"
+    )
+
+    with pytest.raises(StateConflictError, match="manifest|mutation|product"):
+        services.orchestrator.resume()
+
+    assert backend.requests == []
+    assert count_candidate_commits(project) == 0
+
+
+def test_resume_rejects_same_path_content_changed_after_development_journal(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    prepare = services.git.prepare_candidate
+    services.git.prepare_candidate = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("crash after development journal")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="development journal"):
+        services.orchestrator.run(max_loops=1)
+    services.git.prepare_candidate = prepare  # type: ignore[method-assign]
+    backend.requests.clear()
+    (project / "product.txt").write_text(
+        "mutated after durable development\n", encoding="utf-8"
+    )
+
+    with pytest.raises(StateConflictError, match="manifest|mutation|content"):
+        services.orchestrator.resume()
+
+    assert backend.requests == []
+    assert count_candidate_commits(project) == 0
+
+
 def test_resume_recovers_evidence_commit_that_landed_before_closure_journal(
     tmp_path: Path,
 ) -> None:
@@ -308,6 +376,37 @@ def test_resume_fails_closed_on_malformed_attempt_receipt_history(
         services.orchestrator.resume()
 
     assert len(backend.requests) == 2
+
+
+def test_resume_rejects_renamed_attempt_receipt_before_another_backend_call(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = ScriptedBackend(
+        [BackendTimeout("first timeout"), FakeResponse(plan())]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    repair_prompt = services.orchestrator._repair_prompt
+    services.orchestrator._repair_prompt = (  # type: ignore[method-assign]
+        lambda prompt, error: (_ for _ in ()).throw(
+            RuntimeError("simulated process loss before retry")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="process loss"):
+        services.orchestrator.run(max_loops=1)
+    services.orchestrator._repair_prompt = repair_prompt  # type: ignore[method-assign]
+    receipt = next(
+        (project / ".hoh" / "runs").glob(
+            "*/loops/loop-0001/receipts/planner-attempt-01.json"
+        )
+    )
+    receipt.rename(receipt.with_name("planner-renamed-attempt-01.json"))
+
+    with pytest.raises(StateConflictError, match="receipt|filename|attempt"):
+        services.orchestrator.resume()
+
+    assert len(backend.requests) == 1
 
 
 def test_elapsed_time_rebases_once_when_a_later_loop_resumes(tmp_path: Path) -> None:

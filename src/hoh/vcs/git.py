@@ -9,6 +9,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 
 
 class GitError(RuntimeError):
@@ -115,7 +116,12 @@ class GitService:
             self.prepare_candidate(loop_index, summary)
         )
 
-    def prepare_candidate(self, loop_index: int, summary: str) -> PreparedCommit:
+    def prepare_candidate(
+        self,
+        loop_index: int,
+        summary: str,
+        paths: tuple[str, ...] | None = None,
+    ) -> PreparedCommit:
         """Create the exact candidate commit object without moving the run branch."""
 
         self._require_run_branch()
@@ -127,7 +133,22 @@ class GitService:
             raise ProtectedPathError(
                 "protected path is staged: " + ", ".join(staged_host_state)
             )
-        production_pathspec = (".", ":(exclude).hoh", ":(exclude).hoh/**")
+        parent_sha = self.head_sha()
+        current_paths = tuple(
+            path
+            for path in self.changed_paths(parent_sha)
+            if path != ".hoh" and not path.startswith(".hoh/")
+        )
+        selected_paths = self._candidate_paths(
+            current_paths if paths is None else paths
+        )
+        if current_paths != selected_paths:
+            raise GitError(
+                "candidate mutation paths do not match the validated literal path set"
+            )
+        production_pathspec = tuple(
+            f":(top,literal){path}" for path in selected_paths
+        )
         return self._prepare_commit(
             "candidate",
             loop_index,
@@ -312,6 +333,27 @@ class GitService:
                 raise GitError("evidence paths must not select the repository or .git")
             selected.append(f":(top,literal){relative_path.as_posix()}")
         return tuple(dict.fromkeys(selected))
+
+    @staticmethod
+    def _candidate_paths(paths: tuple[str, ...]) -> tuple[str, ...]:
+        if not paths:
+            raise GitError("at least one candidate mutation path is required")
+        selected: list[str] = []
+        for supplied in paths:
+            if not isinstance(supplied, str) or not supplied:
+                raise GitError("candidate mutation paths must be non-empty strings")
+            path = PurePosixPath(supplied)
+            if (
+                path.is_absolute()
+                or supplied != path.as_posix()
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or path.parts[0] in {".git", ".hoh"}
+            ):
+                raise GitError("candidate mutation path is not a normalized product path")
+            selected.append(supplied)
+        if len(selected) != len(set(selected)):
+            raise GitError("candidate mutation path set contains duplicates")
+        return tuple(sorted(selected))
 
     def _protected_path(self, supplied_path: str) -> tuple[str, Path]:
         path = Path(supplied_path)

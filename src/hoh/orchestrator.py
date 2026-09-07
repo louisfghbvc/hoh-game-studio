@@ -7,13 +7,14 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
@@ -270,6 +271,7 @@ class HoHOrchestrator:
             development,
             candidate,
             checks,
+            manifest,
             qa,
             started,
             elapsed_base,
@@ -374,10 +376,21 @@ class HoHOrchestrator:
     ) -> dict[str, object]:
         payload = self._phase_payload(run_id, loop_index, Phase.DEVELOPMENT)
         if payload is not None:
+            changed_paths = list(_string_sequence(payload.get("changed_paths")))
+            base_sha = _required_text(payload, "base_sha")
+            mutation_manifest = self._read_descriptor(
+                payload, "mutation_manifest"
+            )
+            self._validate_product_mutation_manifest(
+                mutation_manifest,
+                expected_base_sha=base_sha,
+                expected_paths=changed_paths,
+            )
             return {
                 "report": self._read_descriptor(payload, "report"),
-                "base_sha": _required_text(payload, "base_sha"),
-                "changed_paths": list(_string_sequence(payload.get("changed_paths"))),
+                "base_sha": base_sha,
+                "changed_paths": changed_paths,
+                "mutation_manifest": mutation_manifest,
             }
         skills = self._developer_skills(plan)
         prompt = self.prompt_renderer.render(
@@ -406,17 +419,28 @@ class HoHOrchestrator:
             ),
         )
         changed_paths = self._production_changed_paths(base_sha)
+        mutation_manifest = self._product_mutation_manifest(
+            base_sha, changed_paths
+        )
         report_path = loop_dir / "developer-report.json"
+        mutation_manifest_path = loop_dir / "product-mutation.json"
         atomic_write_json(report_path, report)
+        atomic_write_json(mutation_manifest_path, mutation_manifest)
         phase_payload = {
             "report": self._descriptor(report_path),
             "base_sha": base_sha,
             "changed_paths": list(changed_paths),
+            "mutation_manifest": self._descriptor(mutation_manifest_path),
         }
         self.store.complete_phase(
             run_id, loop_index, Phase.DEVELOPMENT, phase_payload
         )
-        return {"report": report, "base_sha": base_sha, "changed_paths": list(changed_paths)}
+        return {
+            "report": report,
+            "base_sha": base_sha,
+            "changed_paths": list(changed_paths),
+            "mutation_manifest": mutation_manifest,
+        }
 
     def _ensure_candidate(
         self,
@@ -434,6 +458,12 @@ class HoHOrchestrator:
         summary = _required_text(report, "summary")
         base_sha = _required_text(development, "base_sha")
         changed_paths = list(_string_sequence(development.get("changed_paths")))
+        mutation_manifest = _required_mapping(development, "mutation_manifest")
+        mutation_hashes = self._assert_product_mutation_matches(
+            base_sha,
+            changed_paths,
+            mutation_manifest,
+        )
         intent_path = loop_dir / "candidate-commit-intent.json"
         prepared = self._load_commit_intent(
             intent_path,
@@ -441,14 +471,21 @@ class HoHOrchestrator:
             expected_loop_index=loop_index,
             expected_parent_sha=base_sha,
             expected_selected_paths=changed_paths,
-            expected_selected_hashes={},
+            expected_selected_hashes=mutation_hashes,
         )
         if prepared is None:
             if self.git.head_sha() != base_sha:
                 raise StateConflictError(
                     "Git HEAD moved before candidate commit intent was durable"
                 )
-            prepared = self.git.prepare_candidate(loop_index, summary)
+            try:
+                prepared = self.git.prepare_candidate(
+                    loop_index, summary, tuple(changed_paths)
+                )
+            except GitError as error:
+                raise StateConflictError(
+                    "candidate repository mutations do not match the durable manifest"
+                ) from error
             if prepared.parent_sha != base_sha:
                 raise StateConflictError(
                     "prepared candidate has a different expected parent"
@@ -457,7 +494,7 @@ class HoHOrchestrator:
                 intent_path,
                 prepared,
                 changed_paths,
-                {},
+                mutation_hashes,
             )
         try:
             candidate_sha = self.git.land_prepared_commit(prepared)
@@ -901,6 +938,7 @@ class HoHOrchestrator:
         development: dict[str, object],
         candidate: dict[str, object],
         checks: dict[str, object],
+        manifest: dict[str, object],
         qa: dict[str, object],
         started: float,
         elapsed_base: int,
@@ -950,7 +988,7 @@ class HoHOrchestrator:
             "acceptance_claim_ids": acceptance_claim_ids,
             "changed_paths": list(_string_sequence(development.get("changed_paths"))),
         }
-        attempts = self._attempt_receipts(loop_dir)
+        attempts = self._attempt_receipts(run_id, loop_index, loop_dir)
         receipt = {
             "schema_version": 1,
             "run_id": run_id,
@@ -989,11 +1027,14 @@ class HoHOrchestrator:
                 },
             )
 
-        selected = self._evidence_commit_paths(loop_dir)
-        best_path = self.config.project / ".hoh" / "best-candidate.json"
-        if best_path.is_file():
-            selected.append(best_path)
-        selected = sorted(set(selected), key=lambda path: path.as_posix())
+        selected = self._evidence_commit_paths(
+            run_id,
+            loop_index,
+            loop_dir,
+            manifest,
+            qa,
+            include_best=decision.terminal_status == "complete",
+        )
         selected_paths = [self._project_relative(path) for path in selected]
         selected_hashes = {
             self._project_relative(path): _file_sha256(path) for path in selected
@@ -1790,13 +1831,177 @@ class HoHOrchestrator:
             if not any(path == root or path.startswith(root + "/") for root in protected)
         )
 
-    def _attempt_receipts(self, loop_dir: Path) -> list[dict[str, object]]:
-        receipts_dir = loop_dir / "receipts"
-        if not receipts_dir.is_dir():
-            return []
+    def _product_mutation_manifest(
+        self, base_sha: str, paths: Sequence[str]
+    ) -> dict[str, object]:
+        entries = [self._product_mutation_entry(path) for path in paths]
+        document: dict[str, object] = {
+            "schema_version": 1,
+            "base_sha": base_sha,
+            "entries": entries,
+        }
+        self._validate_product_mutation_manifest(
+            document,
+            expected_base_sha=base_sha,
+            expected_paths=paths,
+        )
+        return document
+
+    def _assert_product_mutation_matches(
+        self,
+        base_sha: str,
+        changed_paths: Sequence[str],
+        manifest: Mapping[str, object],
+    ) -> dict[str, str]:
+        entries = self._validate_product_mutation_manifest(
+            manifest,
+            expected_base_sha=base_sha,
+            expected_paths=changed_paths,
+        )
+        current_paths = self._production_changed_paths(base_sha)
+        if tuple(changed_paths) != current_paths:
+            raise StateConflictError(
+                "current product mutation paths do not match the durable manifest"
+            )
+        current_entries = [
+            self._product_mutation_entry(path) for path in current_paths
+        ]
+        if current_entries != entries:
+            raise StateConflictError(
+                "current product mutation content does not match the durable manifest"
+            )
+        return {
+            str(entry["path"]): hashlib.sha256(
+                json.dumps(
+                    entry,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            for entry in entries
+        }
+
+    def _validate_product_mutation_manifest(
+        self,
+        manifest: Mapping[str, object],
+        *,
+        expected_base_sha: str,
+        expected_paths: Sequence[str],
+    ) -> list[dict[str, object]]:
+        if (
+            set(manifest) != {"schema_version", "base_sha", "entries"}
+            or manifest.get("schema_version") != 1
+            or manifest.get("base_sha") != expected_base_sha
+        ):
+            raise StateConflictError("durable product mutation manifest is malformed")
+        raw_entries = manifest.get("entries")
+        if not isinstance(raw_entries, list):
+            raise StateConflictError("durable product mutation manifest entries are malformed")
+        entries: list[dict[str, object]] = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, Mapping) or set(raw_entry) != {
+                "path",
+                "type",
+                "sha256",
+            }:
+                raise StateConflictError(
+                    "durable product mutation manifest entry is malformed"
+                )
+            path = raw_entry.get("path")
+            entry_type = raw_entry.get("type")
+            digest = raw_entry.get("sha256")
+            if not isinstance(path, str):
+                raise StateConflictError(
+                    "durable product mutation manifest path is malformed"
+                )
+            self._product_path(path)
+            if entry_type == "deleted":
+                if digest is not None:
+                    raise StateConflictError(
+                        "durable deleted product mutation has a content hash"
+                    )
+            elif entry_type in {"file", "symlink"}:
+                if not isinstance(digest, str) or re.fullmatch(
+                    r"[0-9a-f]{64}", digest
+                ) is None:
+                    raise StateConflictError(
+                        "durable product mutation content hash is malformed"
+                    )
+            else:
+                raise StateConflictError(
+                    "durable product mutation type is malformed"
+                )
+            entries.append(dict(raw_entry))
+        entry_paths = [str(entry["path"]) for entry in entries]
+        if (
+            entry_paths != sorted(entry_paths)
+            or len(entry_paths) != len(set(entry_paths))
+            or entry_paths != list(expected_paths)
+        ):
+            raise StateConflictError(
+                "durable product mutation manifest path set is ambiguous"
+            )
+        return entries
+
+    def _product_mutation_entry(self, relative: str) -> dict[str, object]:
+        path = self._product_path(relative)
+        if path.is_symlink():
+            target = os.readlink(path).encode("utf-8", errors="surrogateescape")
+            return {
+                "path": relative,
+                "type": "symlink",
+                "sha256": hashlib.sha256(target).hexdigest(),
+            }
+        if not path.exists():
+            return {"path": relative, "type": "deleted", "sha256": None}
+        try:
+            mode = path.stat().st_mode
+        except OSError as error:
+            raise StateConflictError(
+                "product mutation cannot be inspected"
+            ) from error
+        if not stat.S_ISREG(mode):
+            raise StateConflictError(
+                "product mutation must be a regular file, symlink, or deletion"
+            )
+        return {
+            "path": relative,
+            "type": "file",
+            "sha256": _file_sha256(path),
+        }
+
+    def _product_path(self, relative: str) -> Path:
+        if not isinstance(relative, str) or not relative or "\\" in relative:
+            raise StateConflictError("product mutation path is not normalized")
+        path = PurePosixPath(relative)
+        if (
+            path.is_absolute()
+            or relative != path.as_posix()
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or path.parts[0].endswith(":")
+        ):
+            raise StateConflictError("product mutation path is not normalized")
+        protected = tuple(
+            PurePosixPath(item).as_posix().rstrip("/")
+            for item in self.config.protected_paths
+        )
+        if any(
+            relative == root or relative.startswith(root + "/")
+            for root in protected
+        ):
+            raise StateConflictError("product mutation path is protected")
+        return self.config.project.joinpath(*path.parts)
+
+    def _attempt_receipts(
+        self, run_id: str, loop_index: int, loop_dir: Path
+    ) -> list[dict[str, object]]:
         receipts = [
-            _read_json(path)
-            for path in receipts_dir.glob("*.json")
+            receipt
+            for _, receipt, external in self._validated_receipt_records(
+                run_id, loop_index, loop_dir
+            )
+            if not external
         ]
         return sorted(receipts, key=_receipt_sort_key)
 
@@ -1808,118 +2013,282 @@ class HoHOrchestrator:
         role: Role,
         kind: str,
     ) -> list[dict[str, object]]:
-        prefix = f"{role.value}-" if kind == "ordinary" else f"{role.value}-{kind}-"
-        external_receipts = (
+        return [
+            receipt
+            for _, receipt, _ in self._validated_receipt_records(
+                run_id, loop_index, loop_dir
+            )
+            if receipt.get("role") == role.value and receipt.get("kind") == kind
+        ]
+
+    def _validated_receipt_records(
+        self, run_id: str, loop_index: int, loop_dir: Path
+    ) -> list[tuple[Path, dict[str, object], bool]]:
+        maximum_attempts = 1 + min(self.config.max_role_retries, 1)
+        external_dir = (
             self._host_staging_root
             / run_id
             / f"loop-{loop_index:04d}"
             / "audit"
             / "receipts"
         )
-        receipt_paths = [
-            *(loop_dir / "receipts").glob(f"{prefix}attempt-*.json"),
-            *external_receipts.glob(f"{prefix}attempt-*.json"),
-        ]
-        indexed_paths: list[tuple[int, Path]] = []
-        for path in receipt_paths:
-            match = re.fullmatch(
-                rf"{re.escape(prefix)}attempt-(\d+)\.json", path.name
-            )
-            if match is None:
-                raise StateConflictError(
-                    f"durable {role.value} receipt filename is malformed"
-                )
-            indexed_paths.append((int(match.group(1)), path))
-        indexed_paths.sort(key=lambda item: (item[0], item[1].as_posix()))
-        receipts: list[dict[str, object]] = []
-        for expected_attempt, (recorded_attempt, path) in enumerate(
-            indexed_paths, start=1
+        records: list[tuple[Path, dict[str, object], bool]] = []
+        indexed: dict[tuple[str, str, int], tuple[Path, bool]] = {}
+        pattern = re.compile(
+            r"^(planner|developer|qa)(?:-(full-release))?-attempt-(\d{2})\.json$"
+        )
+        for directory, external in (
+            (loop_dir / "receipts", False),
+            (external_dir, True),
         ):
-            if recorded_attempt != expected_attempt:
+            if directory.is_symlink():
                 raise StateConflictError(
-                    f"durable {role.value} receipt attempt sequence is ambiguous"
+                    "durable receipt directory must not be a symlink"
                 )
+            if not directory.exists():
+                continue
+            if not directory.is_dir():
+                raise StateConflictError(
+                    "durable receipt directory is not a regular directory"
+                )
+            for path in sorted(directory.iterdir(), key=lambda item: item.name):
+                if path.is_symlink() or not path.is_file():
+                    raise StateConflictError(
+                        "durable receipt directory contains a non-regular entry"
+                    )
+                match = pattern.fullmatch(path.name)
+                if match is None:
+                    raise StateConflictError("durable receipt filename is malformed")
+                role_value, release_marker, attempt_text = match.groups()
+                kind = "full-release" if release_marker else "ordinary"
+                if kind == "full-release" and role_value != Role.QA.value:
+                    raise StateConflictError("durable receipt invocation kind is invalid")
+                attempt = int(attempt_text)
+                if attempt < 1 or attempt > maximum_attempts:
+                    raise StateConflictError(
+                        "durable receipt exceeds the total attempt allowance"
+                    )
+                key = (role_value, kind, attempt)
+                if key in indexed:
+                    raise StateConflictError("durable receipt attempt is duplicated")
+                indexed[key] = (path, external)
+
+        grouped: dict[tuple[str, str], list[int]] = {}
+        for role_value, kind, attempt in indexed:
+            grouped.setdefault((role_value, kind), []).append(attempt)
+        for attempts in grouped.values():
+            ordered = sorted(attempts)
+            if ordered != list(range(1, len(ordered) + 1)):
+                raise StateConflictError("durable receipt attempt sequence is ambiguous")
+
+        for (role_value, kind, attempt), (path, external) in sorted(
+            indexed.items(), key=lambda item: item[0]
+        ):
             try:
                 receipt = _read_json(path)
             except (OSError, json.JSONDecodeError, StateError) as error:
-                raise StateConflictError(
-                    f"durable {role.value} receipt history is malformed"
-                ) from error
+                raise StateConflictError("durable receipt history is malformed") from error
             invocation_id = (
-                f"{run_id}:loop-{loop_index:04d}:{role.value}:{kind}:"
-                f"attempt-{expected_attempt:02d}"
+                f"{run_id}:loop-{loop_index:04d}:{role_value}:{kind}:"
+                f"attempt-{attempt:02d}"
             )
             outcome = receipt.get("outcome")
-            recorded_metadata_attempt = receipt.get("attempt")
+            metadata_attempt = receipt.get("attempt")
             executable_version = receipt.get("executable_version")
             if (
                 receipt.get("invocation_id") != invocation_id
-                or receipt.get("role") != role.value
+                or receipt.get("role") != role_value
                 or receipt.get("kind") != kind
-                or isinstance(recorded_metadata_attempt, bool)
-                or not isinstance(recorded_metadata_attempt, int)
-                or recorded_metadata_attempt != expected_attempt
-                or outcome not in {
-                    "success",
-                    "schema_invalid",
-                    "error",
-                    "policy_violation",
-                }
+                or isinstance(metadata_attempt, bool)
+                or not isinstance(metadata_attempt, int)
+                or metadata_attempt != attempt
+                or outcome
+                not in {"success", "schema_invalid", "error", "policy_violation"}
                 or not isinstance(executable_version, str)
                 or not executable_version.strip()
             ):
+                raise StateConflictError("durable receipt attempt metadata is malformed")
+            if external is not (outcome == "policy_violation"):
                 raise StateConflictError(
-                    f"durable {role.value} receipt attempt metadata is malformed"
+                    "durable boundary-audit receipt is stored in the wrong authority"
                 )
             if outcome == "success":
                 if "error" in receipt:
-                    raise StateConflictError(
-                        f"durable {role.value} success receipt is ambiguous"
-                    )
+                    raise StateConflictError("durable success receipt is ambiguous")
             else:
                 error = receipt.get("error")
                 if (
                     not isinstance(error, Mapping)
                     or not isinstance(error.get("type"), str)
-                    or not isinstance(error.get("message"), str)
                     or not str(error.get("type")).strip()
+                    or not isinstance(error.get("message"), str)
                 ):
-                    raise StateConflictError(
-                        f"durable {role.value} failure receipt is malformed"
-                    )
-            receipts.append(receipt)
-        return receipts
+                    raise StateConflictError("durable failure receipt is malformed")
+            event_name = (
+                f"{role_value}-events-attempt-{attempt:02d}.jsonl"
+                if kind == "ordinary"
+                else f"{role_value}-{kind}-events-attempt-{attempt:02d}.jsonl"
+            )
+            expected_event = (
+                "host-staging/"
+                + (
+                    Path(run_id)
+                    / f"loop-{loop_index:04d}"
+                    / "audit"
+                    / event_name
+                ).as_posix()
+                if external
+                else self._project_relative(loop_dir / event_name)
+            )
+            if receipt.get("events_path") != expected_event:
+                raise StateConflictError("durable receipt event identity is malformed")
+            records.append((path, receipt, external))
+        return records
 
-    def _evidence_commit_paths(self, loop_dir: Path) -> list[Path]:
-        selected_names = {
+    def _evidence_commit_paths(
+        self,
+        run_id: str,
+        loop_index: int,
+        loop_dir: Path,
+        manifest: Mapping[str, object],
+        qa: Mapping[str, object],
+        *,
+        include_best: bool,
+    ) -> list[Path]:
+        """Return only explicitly named, host-known artifacts for this loop."""
+
+        selected: list[Path] = []
+        for name in (
             "plan.json",
             "developer-report.json",
-            "candidate.json",
+            "product-mutation.json",
             "candidate-commit-intent.json",
+            "candidate.json",
             "baseline-checks.json",
             "checks.json",
             "adapter-manifest.json",
             "evidence.json",
-            "release-checks.json",
-            "release-adapter-manifest.json",
-            "release-evidence.json",
             "receipt.json",
             "loop-record.json",
-        }
-        selected = [
-            path
-            for path in loop_dir.rglob("*")
-            if path.is_file()
-            and (
-                path.name in selected_names
-                or path.suffix == ".jsonl"
-                or "receipts" in path.relative_to(loop_dir).parts
-                or path.relative_to(loop_dir).parts[0]
-                in {"adapter", "release-adapter"}
+        ):
+            selected.append(
+                self._required_regular_evidence_path(loop_dir / name, loop_dir)
             )
-        ]
-        selected.append(self.config.project / ".hoh" / "issue-ledger.json")
+        selected.extend(self._validated_manifest_artifact_paths(loop_dir, manifest))
+
+        release_gate = _optional_mapping(qa.get("release_gate"))
+        if release_gate:
+            release_manifest = self._read_descriptor(release_gate, "manifest")
+            for name in (
+                "release-checks.json",
+                "release-adapter-manifest.json",
+                "release-evidence.json",
+            ):
+                selected.append(
+                    self._required_regular_evidence_path(loop_dir / name, loop_dir)
+                )
+            selected.extend(
+                self._validated_manifest_artifact_paths(loop_dir, release_manifest)
+            )
+
+        for receipt_path, receipt, external in self._validated_receipt_records(
+            run_id, loop_index, loop_dir
+        ):
+            if external:
+                raise StateConflictError(
+                    "a boundary-audit failure cannot be included in loop closure"
+                )
+            selected.append(
+                self._required_regular_evidence_path(receipt_path, loop_dir)
+            )
+            event_relative = receipt.get("events_path")
+            if not isinstance(event_relative, str):
+                raise StateConflictError("durable receipt event path is malformed")
+            event_path = self.config.project.joinpath(
+                *PurePosixPath(event_relative).parts
+            )
+            selected.append(
+                self._required_regular_evidence_path(event_path, loop_dir)
+            )
+
+        selected.append(
+            self._required_regular_evidence_path(
+                self.config.project / ".hoh" / "issue-ledger.json",
+                self.config.project / ".hoh",
+            )
+        )
+        if include_best:
+            selected.append(
+                self._required_regular_evidence_path(
+                    self.config.project / ".hoh" / "best-candidate.json",
+                    self.config.project / ".hoh",
+                )
+            )
         return sorted(set(selected), key=lambda path: path.as_posix())
+
+    def _validated_manifest_artifact_paths(
+        self, loop_dir: Path, manifest: Mapping[str, object]
+    ) -> list[Path]:
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, Mapping):
+            raise StateConflictError("durable adapter manifest artifacts are malformed")
+        if not all(
+            isinstance(relative, str) and isinstance(digest, str)
+            for relative, digest in artifacts.items()
+        ):
+            raise StateConflictError(
+                "durable adapter manifest artifact identity is malformed"
+            )
+        selected: list[Path] = []
+        for relative, expected_hash in sorted(artifacts.items()):
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+            ):
+                raise StateConflictError(
+                    "durable adapter manifest artifact identity is malformed"
+                )
+            path = PurePosixPath(relative)
+            if (
+                not relative
+                or "\\" in relative
+                or path.is_absolute()
+                or relative != path.as_posix()
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or path.parts[0].endswith(":")
+            ):
+                raise StateConflictError(
+                    "durable adapter manifest artifact path is not normalized"
+                )
+            artifact_path = self._required_regular_evidence_path(
+                loop_dir.joinpath(*path.parts), loop_dir
+            )
+            if _file_sha256(artifact_path) != expected_hash:
+                raise StateConflictError(
+                    "durable adapter manifest artifact hash does not match"
+                )
+            selected.append(artifact_path)
+        return selected
+
+    def _required_regular_evidence_path(self, path: Path, root: Path) -> Path:
+        try:
+            relative = path.relative_to(root)
+        except ValueError as error:
+            raise StateConflictError(
+                "selected evidence path is outside its authority"
+            ) from error
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise StateConflictError(
+                    "selected evidence path must not traverse a symlink"
+                )
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root.resolve()) or not resolved.is_file():
+            raise StateConflictError(
+                "selected evidence path is missing, non-regular, or outside its authority"
+            )
+        return resolved
 
     def _record_closed_loop(
         self,
@@ -1943,7 +2312,9 @@ class HoHOrchestrator:
             receipt
             for index in range(1, loop_index + 1)
             for receipt in self._attempt_receipts(
-                run_dir / "loops" / f"loop-{index:04d}"
+                _required_text(run_state, "run_id"),
+                index,
+                run_dir / "loops" / f"loop-{index:04d}",
             )
         ]
         run_state["skill_receipts"] = _unique_skill_receipts(
