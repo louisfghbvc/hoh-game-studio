@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -17,6 +18,8 @@ _USAGE_FIELDS = (
     "reasoning_output_tokens",
 )
 _FAILURE_CATEGORIES = frozenset({"infrastructure", "protocol"})
+_SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_FULL_GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 def build_status(
@@ -42,14 +45,19 @@ def build_status(
     failures = _failures(run_state, loops, resolved_decision)
     terminal_status = resolved_decision["terminal_status"]
     run_id = _text(run_state.get("run_id"))
+    current_candidate = _candidate(run_state, "current_candidate")
     best_candidate = _candidate(run_state, "best_candidate")
+    if terminal_status == "complete" and best_candidate is None:
+        best_candidate = _completion_bound_current_candidate(loops, current_candidate)
+    merge_candidate = best_candidate if _valid_git_sha(best_candidate) else None
+    terminal_failure_category = _failure_category(_text(resolved_decision["reason"]))
 
     status: dict[str, object] = {
         "run_id": run_id,
         "terminal_status": terminal_status,
         "reason": resolved_decision["reason"],
         "start_sha": _text(run_state.get("start_sha")),
-        "current_candidate": _candidate(run_state, "current_candidate"),
+        "current_candidate": current_candidate,
         "best_candidate": best_candidate,
         "completed_loops": len(loops),
         "role_attempts": role_attempts,
@@ -60,9 +68,9 @@ def build_status(
         "remaining_gaps": gaps,
         "issue_summary": _issue_summary(issues),
         "failures": failures,
-        "failure_category": failures[0]["category"] if failures else None,
+        "failure_category": terminal_failure_category,
         "skills": _skills(run_state),
-        "guidance": _guidance(terminal_status, run_id, best_candidate),
+        "guidance": _guidance(terminal_status, run_id, merge_candidate),
     }
     return status
 
@@ -70,7 +78,7 @@ def build_status(
 def render_run_summary(status: Mapping[str, object]) -> str:
     """Render a stable, human-readable report from a machine status document."""
 
-    terminal_status = _text(status.get("terminal_status")) or "running"
+    terminal_status = _display(_text(status.get("terminal_status")) or "running")
     lines = [
         "# HoH Run Summary",
         "",
@@ -91,7 +99,7 @@ def render_run_summary(status: Mapping[str, object]) -> str:
     for role in sorted(set(attempts) | set(usage)):
         usage_record = _mapping(usage.get(role))
         lines.append(
-            f"- {role}: attempts={_display(attempts.get(role))}, "
+            f"- {_display(role)}: attempts={_display(attempts.get(role))}, "
             f"tokens={_display(usage_record.get('total_tokens'))}, "
             f"input={_display(usage_record.get('input_tokens'))}, "
             f"cached_input={_display(usage_record.get('cached_input_tokens'))}, "
@@ -119,7 +127,7 @@ def render_run_summary(status: Mapping[str, object]) -> str:
     for failure in sorted(failures, key=_failure_key):
         category = _display(failure.get("category"))
         detail = _text(failure.get("code")) or _text(failure.get("reason")) or "unknown"
-        lines.append(f"- {category}: {detail}")
+        lines.append(f"- {category}: {_display(detail)}")
     if not failures:
         lines.append("- none")
 
@@ -266,15 +274,31 @@ def _skills(run_state: Mapping[str, object]) -> list[dict[str, object]]:
 
 
 def _guidance(status: object, run_id: str | None, best_candidate: str | None) -> str:
-    if status == "complete" and best_candidate is not None:
+    if status == "complete":
+        if best_candidate is None:
+            return "Manual action required: complete run has no canonical merge candidate."
         return f"git merge {best_candidate}"
-    if run_id is not None:
+    if run_id is not None and _SAFE_RUN_ID.fullmatch(run_id):
         return f"hoh resume --run-id {run_id}"
-    return "hoh resume"
+    return "Manual action required: run ID is not a safe resume token."
 
 
 def _candidate(run_state: Mapping[str, object], name: str) -> str | None:
     return _text(run_state.get(name)) or _text(run_state.get(f"{name}_sha"))
+
+
+def _completion_bound_current_candidate(
+    loops: Sequence[Mapping[str, object]], current_candidate: str | None
+) -> str | None:
+    if not _valid_git_sha(current_candidate) or not loops:
+        return None
+    latest_evidence = _evidence(loops[-1])
+    if (
+        latest_evidence.get("candidate_sha") == current_candidate
+        and latest_evidence.get("product_complete") is True
+    ):
+        return current_candidate
+    return None
 
 
 def _evidence(loop: Mapping[str, object]) -> Mapping[str, object]:
@@ -321,6 +345,10 @@ def _failure_category(reason: str | None) -> str | None:
     return None
 
 
+def _valid_git_sha(value: str | None) -> bool:
+    return value is not None and _FULL_GIT_SHA.fullmatch(value) is not None
+
+
 def _bullet_values(value: object) -> list[str]:
     values = value if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)) else ()
     rendered = [f"- {_display(item)}" for item in sorted(item for item in values if isinstance(item, str))]
@@ -330,4 +358,16 @@ def _bullet_values(value: object) -> list[str]:
 def _display(value: object) -> str:
     if value is None:
         return "none"
-    return str(value)
+    return "".join(
+        character if character.isprintable() else _escaped_control(character)
+        for character in str(value)
+    )
+
+
+def _escaped_control(character: str) -> str:
+    codepoint = ord(character)
+    if codepoint <= 0xFF:
+        return f"\\x{codepoint:02x}"
+    if codepoint <= 0xFFFF:
+        return f"\\u{codepoint:04x}"
+    return f"\\U{codepoint:08x}"

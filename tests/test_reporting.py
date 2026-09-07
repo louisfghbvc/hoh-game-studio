@@ -90,6 +90,7 @@ def test_report_contains_candidate_cost_and_resume(tmp_path: Path) -> None:
 def test_status_is_derived_from_receipts_and_ledger_in_stable_order() -> None:
     state = report_fixture()
     state["total_tokens"] = 99_999
+    state["best_candidate"] = "a" * 40
     status = build_status(
         state,
         receipts=receipts(),
@@ -108,7 +109,7 @@ def test_status_is_derived_from_receipts_and_ledger_in_stable_order() -> None:
         "closed": 1,
         "regressed": 1,
     }
-    assert status["guidance"] == "git merge abc123"
+    assert status["guidance"] == "git merge " + "a" * 40
 
 
 def test_status_accepts_persisted_skill_records_and_renders_failure_details() -> None:
@@ -128,3 +129,83 @@ def test_status_accepts_persisted_skill_records_and_renders_failure_details() ->
     assert status["failure_category"] == "protocol"
     assert "- protocol: invalid-evidence" in rendered
     assert "- core: " + "a" * 64 in rendered
+
+
+def test_invalid_run_ids_never_produce_resume_commands_or_markdown_lines() -> None:
+    for run_id in ("run&Write-Output injected", "run-42\r\nStatus: complete"):
+        state = report_fixture()
+        state["run_id"] = run_id
+
+        status = build_status(
+            state,
+            decision=StopDecision(True, "blocked", "unrecoverable protocol failure"),
+        )
+
+        rendered = render_run_summary(status)
+
+        assert status["guidance"].startswith("Manual action required:")
+        assert "hoh resume" not in status["guidance"]
+        assert "\r" not in rendered
+        assert "\nStatus: complete" not in rendered
+
+
+def test_terminal_failure_category_comes_from_decision_not_old_diagnostics() -> None:
+    state = report_fixture()
+    state["diagnostics"] = [{"category": "infrastructure", "code": "old-network"}]
+
+    status = build_status(
+        state,
+        decision=StopDecision(True, "blocked", "unrecoverable protocol failure: bad-evidence"),
+    )
+
+    assert status["failure_category"] == "protocol"
+
+
+def test_complete_without_best_candidate_merges_a_bound_current_candidate() -> None:
+    candidate = "c" * 40
+    state = report_fixture()
+    state.pop("best_candidate")
+    state["current_candidate"] = candidate
+    state["loops"] = [
+        {
+            "normalized_evidence": {
+                "candidate_sha": candidate,
+                "product_complete": True,
+            },
+        }
+    ]
+
+    status = build_status(
+        state,
+        decision=StopDecision(True, "complete", "all required claims verified"),
+    )
+
+    assert status["best_candidate"] == candidate
+    assert status["guidance"] == f"git merge {candidate}"
+
+
+def test_malformed_complete_state_requires_manual_action_instead_of_resume() -> None:
+    state = report_fixture()
+    state.pop("best_candidate")
+    state["current_candidate"] = "not-a-full-sha"
+
+    status = build_status(
+        state,
+        decision=StopDecision(True, "complete", "all required claims verified"),
+    )
+
+    assert status["guidance"].startswith("Manual action required:")
+    assert "hoh resume" not in status["guidance"]
+
+
+def test_complete_with_short_best_candidate_requires_manual_action() -> None:
+    state = report_fixture()
+    state["best_candidate"] = "abc123"
+
+    status = build_status(
+        state,
+        decision=StopDecision(True, "complete", "all required claims verified"),
+    )
+
+    assert status["guidance"].startswith("Manual action required:")
+    assert "git merge" not in status["guidance"]
