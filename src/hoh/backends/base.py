@@ -51,6 +51,7 @@ class AgentResult:
     response: dict[str, object]
     usage: AgentUsage
     return_code: int
+    executable_version: str = "unknown"
 
 
 class AgentBackend(Protocol):

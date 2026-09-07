@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -62,6 +64,37 @@ def test_developer_command_uses_workspace_write(tmp_path: Path) -> None:
     assert "danger-full-access" not in command
 
 
+def test_command_resolves_relative_schema_before_changing_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = agent_request(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    relative_request = replace(request, schema_path=Path("response.schema.json"))
+
+    command = CodexExecBackend("codex").build_command(relative_request)
+
+    assert command[command.index("--output-schema") + 1] == str(
+        (tmp_path / "response.schema.json").resolve()
+    )
+
+
+def test_backend_resolves_relative_executable_with_directory_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "tools" / "codex"
+    executable.parent.mkdir()
+    executable.write_text("fixture", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    backend = CodexExecBackend(str(Path("tools") / "codex"))
+    monkeypatch.chdir(workspace)
+    request = agent_request(tmp_path)
+
+    assert backend.build_command(request)[0] == str(executable.resolve())
+
+
 @pytest.mark.parametrize("role", [Role.PLANNER, Role.QA])
 def test_read_only_role_cannot_request_write_sandbox(
     tmp_path: Path, role: Role
@@ -97,6 +130,7 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 11, "cache
     assert result.response == {"prompt": "prompt with ; shell syntax"}
     assert result.usage == AgentUsage(11, 3, 7, 2)
     assert result.return_code == 0
+    assert result.executable_version.startswith("Python ")
     events = [
         json.loads(line)
         for line in request.events_path.read_text(encoding="utf-8").splitlines()
@@ -202,6 +236,56 @@ def test_process_errors_redact_secret_command_option_values(tmp_path: Path) -> N
     assert "--auth <redacted>" in str(raised.value)
 
 
+def test_process_errors_redact_quoted_and_equal_secret_values(tmp_path: Path) -> None:
+    request = agent_request(tmp_path)
+    diagnostic = (
+        'AUTH="quoted secret value" '
+        "--auth=equal-secret --password 'other secret value'"
+    )
+    backend = executable_backend(
+        request.workspace,
+        f"import sys\nsys.stderr.write({diagnostic!r})\nsys.exit(9)\n",
+    )
+
+    with pytest.raises(BackendProcessError) as raised:
+        backend.run(request)
+
+    message = str(raised.value)
+    assert "quoted secret value" not in message
+    assert "equal-secret" not in message
+    assert "other secret value" not in message
+    assert 'AUTH="<redacted>"' in message
+    assert "--auth=<redacted>" in message
+    assert "--password '<redacted>'" in message
+
+
+def test_retained_events_redact_structured_secrets_without_changing_response(
+    tmp_path: Path,
+) -> None:
+    request = agent_request(tmp_path)
+    backend = executable_backend(
+        request.workspace,
+        """import json
+response = {"status": "pass", "auth_token": "response secret"}
+print(json.dumps({"type": "item.completed", "api_key": "structured secret", "nested": {"password": "nested secret"}, "detail": 'AUTH="quoted secret value" --auth=equal-secret', "item": {"type": "agent_message", "text": json.dumps(response)}}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}}))
+""",
+    )
+
+    result = backend.run(request)
+
+    assert result.response == {"status": "pass", "auth_token": "response secret"}
+    persisted = [
+        json.loads(line)
+        for line in request.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert persisted[0]["api_key"] == "<redacted>"
+    assert persisted[0]["nested"]["password"] == "<redacted>"
+    assert "quoted secret value" not in persisted[0]["detail"]
+    assert "equal-secret" not in persisted[0]["detail"]
+    assert json.loads(persisted[0]["item"]["text"])["auth_token"] == "<redacted>"
+
+
 def test_timeout_raises_distinct_error(tmp_path: Path) -> None:
     request = replace(agent_request(tmp_path), timeout_seconds=1)
     backend = executable_backend(
@@ -213,8 +297,123 @@ def test_timeout_raises_distinct_error(tmp_path: Path) -> None:
         backend.run(request)
 
 
+def test_timeout_terminates_descendant_holding_inherited_pipes(tmp_path: Path) -> None:
+    request = replace(agent_request(tmp_path), timeout_seconds=1)
+    child_pid_path = tmp_path / "child.pid"
+    backend = executable_backend(
+        request.workspace,
+        f"""import subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"], stdout=sys.stdout, stderr=sys.stderr)
+open({json.dumps(str(child_pid_path))}, "w", encoding="utf-8").write(str(child.pid))
+time.sleep(5)
+""",
+    )
+
+    started = time.monotonic()
+    with pytest.raises(BackendTimeout):
+        backend.run(request)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 4.5
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    assert _wait_until_process_exits(child_pid)
+
+
+def test_event_sink_failure_does_not_launch_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = agent_request(tmp_path)
+    request.events_path.mkdir()
+    launched = False
+
+    def unexpected_launch(*args: object, **kwargs: object) -> object:
+        nonlocal launched
+        launched = True
+        raise AssertionError("process launched before event sink validation")
+
+    monkeypatch.setattr("hoh.backends.codex_exec.subprocess.Popen", unexpected_launch)
+    monkeypatch.setattr("hoh.backends.codex_exec.subprocess.run", unexpected_launch)
+
+    with pytest.raises(BackendProcessError, match="event sink"):
+        CodexExecBackend("codex").run(request)
+
+    assert launched is False
+
+
+def test_executable_version_probe_is_shell_free_and_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = agent_request(tmp_path)
+    observed: dict[str, object] = {}
+
+    class TimedOutProbe:
+        pid = 123
+        returncode: int | None = None
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def communicate(self, timeout: float) -> tuple[str, str]:
+            observed["timeout"] = timeout
+            raise subprocess.TimeoutExpired(observed["command"], timeout)
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def wait(self, timeout: float) -> int:
+            self.returncode = -9
+            return self.returncode
+
+    def timed_out_probe(command: list[str], **kwargs: object) -> TimedOutProbe:
+        observed["command"] = command
+        observed.update(kwargs)
+        return TimedOutProbe()
+
+    monkeypatch.setattr("hoh.backends.codex_exec.subprocess.Popen", timed_out_probe)
+    monkeypatch.setattr(
+        CodexExecBackend,
+        "_terminate_process_tree",
+        lambda self, process: process.kill(),
+    )
+
+    with pytest.raises(BackendTimeout, match="version probe"):
+        CodexExecBackend("codex").run(request)
+
+    assert observed["command"] == ["codex", "--version"]
+    assert observed["shell"] is False
+    assert 0 < observed["timeout"] <= request.timeout_seconds
+
+
 def test_missing_executable_is_a_process_error(tmp_path: Path) -> None:
     request = agent_request(tmp_path)
 
     with pytest.raises(BackendProcessError, match="could not start"):
         CodexExecBackend(str(tmp_path / "missing-codex")).run(request)
+
+
+def _wait_until_process_exits(pid: int) -> bool:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not _process_exists(pid):
+            return True
+        time.sleep(0.05)
+    return not _process_exists(pid)
+
+
+def _process_exists(pid: int) -> bool:
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return f'"{pid}"' in completed.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True

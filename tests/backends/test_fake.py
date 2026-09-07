@@ -38,9 +38,21 @@ def test_fake_returns_ordered_responses_and_records_requests(tmp_path: Path) -> 
         ]
     )
 
-    assert backend.run(first).response == {"sequence": 1}
+    first_result = backend.run(first)
+    assert first_result.response == {"sequence": 1}
+    assert first_result.executable_version == "fake-agent/1"
     assert backend.run(second).response == {"sequence": 2}
     assert backend.requests == [first, second]
+
+
+def test_fake_executable_version_is_configurable_and_deterministic(tmp_path: Path) -> None:
+    backend = FakeAgentBackend(
+        [FakeResponse({"status": "pass"})], executable_version="fixture-agent/7"
+    )
+
+    result = backend.run(agent_request(tmp_path))
+
+    assert result.executable_version == "fixture-agent/7"
 
 
 def test_fake_callable_can_bind_response_to_request(tmp_path: Path) -> None:

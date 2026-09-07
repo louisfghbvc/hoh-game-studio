@@ -26,8 +26,14 @@ class FakeResponse:
 class FakeAgentBackend:
     """Return a fixed response sequence without launching external processes."""
 
-    def __init__(self, responses: Sequence[FakeResponse]) -> None:
+    def __init__(
+        self,
+        responses: Sequence[FakeResponse],
+        *,
+        executable_version: str = "fake-agent/1",
+    ) -> None:
         self._responses = list(responses)
+        self._executable_version = executable_version
         self.requests: list[AgentRequest] = []
 
     def run(self, request: AgentRequest) -> AgentResult:
@@ -43,4 +49,6 @@ class FakeAgentBackend:
             if callable(configured.response)
             else configured.response
         )
-        return AgentResult(dict(response), configured.usage, 0)
+        return AgentResult(
+            dict(response), configured.usage, 0, self._executable_version
+        )
