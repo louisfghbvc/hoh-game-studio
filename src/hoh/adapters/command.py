@@ -79,17 +79,18 @@ class CommandAdapter:
         self, context: AdapterContext, plan: Mapping[str, object]
     ) -> CheckBundle:
         del plan
-        records_path = context.output / "checks"
+        project, output = _validated_roots(context)
+        records_path = output / "checks"
         records_path.mkdir(parents=True, exist_ok=True)
         results: list[CheckResult] = []
         retained_paths: list[str] = []
         for index, command in enumerate(self._checks, start=1):
-            result, paths = self._run_command(context.project, records_path, index, command)
+            result, paths = self._run_command(project, records_path, index, command)
             results.append(result)
             retained_paths.extend(paths)
         for artifact in self._required_artifacts:
-            artifact_path = context.project / artifact
-            if artifact_path.is_file():
+            artifact_path = (project / artifact).resolve()
+            if artifact_path.is_relative_to(project) and artifact_path.is_file():
                 results.append(
                     CheckResult(
                         f"artifact:{artifact}",
@@ -182,12 +183,12 @@ class CommandAdapter:
         """Copy configured candidate artifacts into host-owned output with hashes."""
 
         del bundle
-        project = context.project.resolve()
-        destination_root = context.output / "artifacts"
+        project, output = _validated_roots(context)
+        destination_root = output / "artifacts"
         artifacts: dict[str, str] = {}
         sources: dict[str, Path] = {}
         for pattern in self._artifact_globs:
-            for source in context.project.glob(pattern):
+            for source in project.glob(pattern):
                 resolved = source.resolve()
                 if source.is_file() and resolved.is_relative_to(project):
                     relative = resolved.relative_to(project).as_posix()
@@ -196,7 +197,7 @@ class CommandAdapter:
             destination = destination_root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
-            artifacts[str(destination.relative_to(context.output)).replace("\\", "/")] = _sha256(
+            artifacts[str(destination.relative_to(output)).replace("\\", "/")] = _sha256(
                 destination
             )
         return artifacts
@@ -218,6 +219,14 @@ def _bundle_status(results: Sequence[CheckResult]) -> str:
     if any(result.status == "fail" for result in results):
         return "fail"
     return "pass"
+
+
+def _validated_roots(context: AdapterContext) -> tuple[Path, Path]:
+    project = context.project.resolve()
+    output = context.output.resolve()
+    if output.is_relative_to(project):
+        raise ValueError("adapter output must be outside the candidate")
+    return project, output
 
 
 def _matching_pattern(
