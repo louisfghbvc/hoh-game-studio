@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from hoh.state.issue_ledger import IssueLedger
+import pytest
+
+from hoh.state.issue_ledger import IssueLedger, IssueLedgerError
 
 
 def evidence(
@@ -159,6 +161,38 @@ def test_summary_is_derived_from_sorted_issue_entries_on_every_write(tmp_path: P
     assert ledger.summary() == document["summary"]
 
 
+def test_load_replaces_forged_summary_with_counts_derived_from_issues(
+    tmp_path: Path,
+) -> None:
+    """Returning a persisted summary without recounting issues must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "issues": [
+                    {
+                        "claim_id": "player-moves",
+                        "status": "open",
+                        "history": [],
+                    }
+                ],
+                "summary": {"total": 0, "open": 0, "closed": 0, "regressed": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = IssueLedger(path).load()
+
+    assert loaded["summary"] == {
+        "total": 1,
+        "open": 1,
+        "closed": 0,
+        "regressed": 0,
+    }
+
+
 def test_infrastructure_and_protocol_diagnostics_do_not_become_product_issues(
     tmp_path: Path,
 ) -> None:
@@ -173,3 +207,60 @@ def test_infrastructure_and_protocol_diagnostics_do_not_become_product_issues(
 
     assert ledger.load()["issues"] == []
     assert ledger.summary() == {"total": 0, "open": 0, "closed": 0, "regressed": 0}
+
+
+def test_exact_evidence_replay_is_idempotent_and_uses_canonical_identity(
+    tmp_path: Path,
+) -> None:
+    """Appending history for an exact semantic replay must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    original = evidence("a" * 40, gap_records=[gap("player-moves")])
+    reordered = dict(reversed(list(original.items())))
+
+    ledger.apply(original, 1)
+    first_write = path.read_bytes()
+    ledger.apply(reordered, 1)
+
+    document = ledger.load()
+    assert path.read_bytes() == first_write
+    assert len(document["issues"][0]["history"]) == 1
+    assert len(document["applications"]) == 1
+    application = document["applications"][0]
+    assert set(application) == {"loop", "candidate", "evidence_sha256"}
+    assert application["loop"] == 1
+    assert application["candidate"] == "a" * 40
+    assert len(application["evidence_sha256"]) == 64
+
+
+@pytest.mark.parametrize("conflict", ["candidate", "evidence"])
+def test_same_loop_with_different_application_identity_is_rejected(
+    tmp_path: Path, conflict: str
+) -> None:
+    """Accepting two identities for one loop must make this fail."""
+    ledger = IssueLedger(tmp_path / "issue-ledger.json")
+    ledger.apply(evidence("a" * 40, gap_records=[gap("player-moves")]), 1)
+    candidate = "b" * 40 if conflict == "candidate" else "a" * 40
+    severity = "major" if conflict == "candidate" else "blocker"
+
+    with pytest.raises(IssueLedgerError, match="same loop"):
+        ledger.apply(
+            evidence(candidate, gap_records=[gap("player-moves", severity)]),
+            1,
+        )
+
+
+def test_older_loop_after_newer_application_is_rejected(tmp_path: Path) -> None:
+    """Allowing out-of-order applications to regress state must make this fail."""
+    ledger = IssueLedger(tmp_path / "issue-ledger.json")
+    ledger.apply(evidence("b" * 40, gap_records=[gap("player-moves")]), 2)
+
+    with pytest.raises(IssueLedgerError, match="out of order"):
+        ledger.apply(
+            evidence("a" * 40, verified_records=[verified("player-moves")]),
+            1,
+        )
+
+    issue = ledger.load()["issues"][0]
+    assert issue["status"] == "open"
+    assert [event["loop"] for event in issue["history"]] == [2]

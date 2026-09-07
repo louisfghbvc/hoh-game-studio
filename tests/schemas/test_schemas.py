@@ -175,6 +175,17 @@ def test_evidence_rejects_unknown_qa_status(schema_dir: Path) -> None:
         validate(evidence, schema_dir / "evidence.schema.json")
 
 
+@pytest.mark.parametrize("severity", ["major ", "critical"])
+def test_evidence_rejects_noncanonical_gap_severity(
+    schema_dir: Path, severity: str
+) -> None:
+    evidence = valid_evidence()
+    evidence["gap_records"][0]["severity"] = severity  # type: ignore[index]
+
+    with pytest.raises(jsonschema.ValidationError):
+        validate(evidence, schema_dir / "evidence.schema.json")
+
+
 def test_completed_evidence_requires_a_verified_record(schema_dir: Path) -> None:
     evidence = valid_evidence()
     evidence["product_complete"] = True

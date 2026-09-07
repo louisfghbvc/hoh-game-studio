@@ -13,6 +13,9 @@ class EvidenceBindingError(ValueError):
     """Raised when QA evidence cannot be bound to host-owned facts."""
 
 
+_GAP_SEVERITIES = frozenset({"blocker", "major", "minor"})
+
+
 class EvidenceNormalizer:
     """Bind schema-valid QA evidence to a candidate and retained artifacts."""
 
@@ -88,9 +91,9 @@ class EvidenceNormalizer:
         )
         verified_claim_ids = {_claim_id(record) for record in verified_records}
         verified_required_claim_ids = required_claim_ids & verified_claim_ids
+        gap_severities = [_gap_severity(record) for record in gap_records]
         has_blocking_gap = any(
-            str(record.get("severity", "")).casefold() in {"blocker", "major"}
-            for record in gap_records
+            severity in {"blocker", "major"} for severity in gap_severities
         )
         product_complete = (
             required_claim_ids <= verified_claim_ids
@@ -151,11 +154,11 @@ def _manifest_parts(
         if not isinstance(nested_artifacts, Mapping):
             raise EvidenceBindingError("adapter manifest artifacts must be an object")
         artifact_values = nested_artifacts
-        checks_passed = manifest.get("status", "pass") == "pass"
+        checks_passed = manifest.get("status") == "pass"
         raw_diagnostics = manifest.get("diagnostics", [])
     else:
         artifact_values = manifest
-        checks_passed = True
+        checks_passed = False
         raw_diagnostics = []
     artifacts: dict[str, str] = {}
     for path, sha256 in artifact_values.items():
@@ -227,6 +230,15 @@ def _claim_id(record: Mapping[str, object]) -> str:
     if not isinstance(claim_id, str) or not claim_id:
         raise EvidenceBindingError("claim_id must be a non-empty string")
     return claim_id
+
+
+def _gap_severity(record: Mapping[str, object]) -> str:
+    severity = record.get("severity")
+    if not isinstance(severity, str) or severity not in _GAP_SEVERITIES:
+        raise EvidenceBindingError(
+            "gap severity must be one of: blocker, major, minor"
+        )
+    return severity
 
 
 def _sha256(path: Path) -> str:

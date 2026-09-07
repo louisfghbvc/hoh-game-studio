@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from copy import deepcopy
@@ -24,13 +25,22 @@ class IssueLedger:
         """Load the ledger, returning an empty document before its first write."""
 
         if not self._path.exists():
-            return {"schema_version": 1, "issues": []}
+            return {
+                "schema_version": 1,
+                "issues": [],
+                "applications": [],
+                "summary": _derived_summary([]),
+            }
         try:
             document = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise IssueLedgerError(f"could not read issue ledger: {self._path}") from error
         if not isinstance(document, dict) or not isinstance(document.get("issues"), list):
             raise IssueLedgerError("issue ledger must contain an issues list")
+        document["applications"] = _validated_applications(
+            document.get("applications", [])
+        )
+        document["summary"] = _derived_summary(document["issues"])
         return document
 
     def apply(self, evidence: Mapping[str, object], loop_index: int) -> None:
@@ -41,10 +51,41 @@ class IssueLedger:
         candidate = evidence.get("candidate_sha")
         if not isinstance(candidate, str) or not candidate:
             raise IssueLedgerError("evidence candidate_sha must be non-empty")
+        evidence_sha256 = _canonical_evidence_sha256(evidence)
 
         document = self.load()
         raw_issues = document["issues"]
         assert isinstance(raw_issues, list)
+        applications = document["applications"]
+        assert isinstance(applications, list)
+        replay = next(
+            (application for application in applications if application["loop"] == loop_index),
+            None,
+        )
+        if replay is not None:
+            if (
+                replay["candidate"] == candidate
+                and replay["evidence_sha256"] == evidence_sha256
+            ):
+                return
+            raise IssueLedgerError(
+                f"same loop {loop_index} already has a different application identity"
+            )
+
+        latest_loop = max(
+            [application["loop"] for application in applications]
+            + _history_loop_indices(raw_issues),
+            default=0,
+        )
+        if loop_index == latest_loop:
+            raise IssueLedgerError(
+                f"same loop {loop_index} has state without a matching application identity"
+            )
+        if loop_index < latest_loop:
+            raise IssueLedgerError(
+                f"loop {loop_index} is out of order after loop {latest_loop}"
+            )
+
         issues: dict[str, dict[str, object]] = {}
         for issue in raw_issues:
             if not isinstance(issue, dict):
@@ -109,9 +150,17 @@ class IssueLedger:
             )
 
         ordered_issues = [issues[claim_id] for claim_id in sorted(issues)]
+        applications.append(
+            {
+                "loop": loop_index,
+                "candidate": candidate,
+                "evidence_sha256": evidence_sha256,
+            }
+        )
         updated: dict[str, object] = {
             "schema_version": 1,
             "issues": ordered_issues,
+            "applications": applications,
             "summary": _derived_summary(ordered_issues),
         }
         atomic_write_json(self._path, updated)
@@ -179,3 +228,69 @@ def _derived_summary(issues: list[object]) -> dict[str, int]:
             raise IssueLedgerError(f"unknown issue status: {status}")
         counts[str(status)] += 1
     return counts
+
+
+def _canonical_evidence_sha256(evidence: Mapping[str, object]) -> str:
+    try:
+        canonical = json.dumps(
+            dict(evidence),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise IssueLedgerError("evidence must be canonical JSON data") from error
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validated_applications(raw: object) -> list[dict[str, object]]:
+    if not isinstance(raw, list):
+        raise IssueLedgerError("issue ledger applications must be a list")
+    applications: list[dict[str, object]] = []
+    previous_loop = 0
+    for application in raw:
+        if not isinstance(application, dict):
+            raise IssueLedgerError("issue ledger application must be an object")
+        loop_index = application.get("loop")
+        candidate = application.get("candidate")
+        evidence_sha256 = application.get("evidence_sha256")
+        if (
+            isinstance(loop_index, bool)
+            or not isinstance(loop_index, int)
+            or loop_index <= previous_loop
+        ):
+            raise IssueLedgerError("issue ledger application loops must strictly increase")
+        if not isinstance(candidate, str) or not candidate:
+            raise IssueLedgerError("issue ledger application candidate must be non-empty")
+        if (
+            not isinstance(evidence_sha256, str)
+            or len(evidence_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in evidence_sha256)
+        ):
+            raise IssueLedgerError("issue ledger application evidence_sha256 is invalid")
+        applications.append(deepcopy(application))
+        previous_loop = loop_index
+    return applications
+
+
+def _history_loop_indices(issues: list[object]) -> list[int]:
+    loop_indices: list[int] = []
+    for issue in issues:
+        if not isinstance(issue, Mapping):
+            raise IssueLedgerError("issue entries must be objects")
+        history = issue.get("history")
+        if not isinstance(history, list):
+            raise IssueLedgerError("issue history must be a list")
+        for event in history:
+            if not isinstance(event, Mapping):
+                raise IssueLedgerError("issue history event must be an object")
+            loop_index = event.get("loop")
+            if (
+                isinstance(loop_index, bool)
+                or not isinstance(loop_index, int)
+                or loop_index < 1
+            ):
+                raise IssueLedgerError("issue history loop must be a positive integer")
+            loop_indices.append(loop_index)
+    return loop_indices

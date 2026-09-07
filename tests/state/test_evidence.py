@@ -268,6 +268,31 @@ def test_host_completion_requires_claims_no_major_gaps_and_passing_checks(
     assert normalized["product_complete"] is False
 
 
+@pytest.mark.parametrize(
+    "adapter_manifest",
+    [
+        {"artifacts": {"frame.png": FRAME_SHA256}},
+        {"frame.png": FRAME_SHA256},
+    ],
+)
+def test_host_completion_requires_affirmative_deterministic_check_status(
+    tmp_path: Path, adapter_manifest: dict[str, object]
+) -> None:
+    """Defaulting a missing check status to pass must make this fail."""
+    (tmp_path / "frame.png").write_bytes(b"frame")
+    raw = evidence(verified_records=[verified("player-moves", "frame.png")])
+
+    normalized = EvidenceNormalizer(tmp_path, requirements()).normalize(
+        raw,
+        EXPECTED_CANDIDATE,
+        EXPECTED_TREE,
+        adapter_manifest,
+    )
+
+    assert normalized["product_complete"] is False
+    assert normalized["host_metadata"]["deterministic_checks_passed"] is False
+
+
 def test_adapter_diagnostics_are_retained_separately_from_gaps(tmp_path: Path) -> None:
     """Mixing infrastructure diagnostics into product gaps must make this fail."""
     raw = evidence(product_complete=False)
@@ -295,4 +320,20 @@ def test_completion_cannot_be_derived_without_a_requirements_registry(
     with pytest.raises(EvidenceBindingError, match="requirements registry"):
         EvidenceNormalizer(tmp_path).normalize(
             raw, EXPECTED_CANDIDATE, EXPECTED_TREE, {}
+        )
+
+
+@pytest.mark.parametrize("severity", ["major ", "critical"])
+def test_normalizer_rejects_noncanonical_gap_severity(
+    tmp_path: Path, severity: str
+) -> None:
+    """Allowing severity aliases to bypass completion gates must make this fail."""
+    raw = evidence(gap_records=[gap("player-moves", severity)])
+
+    with pytest.raises(EvidenceBindingError, match="severity"):
+        EvidenceNormalizer(tmp_path, requirements()).normalize(
+            raw,
+            EXPECTED_CANDIDATE,
+            EXPECTED_TREE,
+            {"status": "pass", "artifacts": {}},
         )
