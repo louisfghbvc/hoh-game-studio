@@ -31,13 +31,16 @@ def loop(
     required_claim_ids: set[str] = {"a"},
     product_complete: bool = False,
     gaps: list[dict[str, str]] | None = None,
-    issue_summary: dict[str, int] | None = None,
+    issue_summary: dict[str, object] | None = None,
     acceptance_claim_ids: set[str] = set(),
     agent_completed: bool = False,
 ) -> dict[str, object]:
+    candidate_sha = "a" * 40
     return {
         "normalized_evidence": {
+            "candidate_sha": candidate_sha,
             "product_complete": product_complete,
+            "qa_status": "pass",
             "verified_records": [
                 {"claim_id": claim_id} for claim_id in sorted(verified_claim_ids)
             ],
@@ -51,7 +54,18 @@ def loop(
             },
         },
         "deterministic_checks_passed": True,
-        "issue_summary": issue_summary or {"total": 0, "open": 0, "closed": 0, "regressed": 0},
+        "deterministic_checks_candidate_sha": candidate_sha,
+        "issues": [],
+        "issues_candidate_sha": candidate_sha,
+        "issue_summary": issue_summary
+        or {
+            "candidate_sha": candidate_sha,
+            "severity_complete": True,
+            "open_blocker": 0,
+            "open_major": 0,
+        },
+        "release_gate_passed": True,
+        "release_gate_candidate_sha": candidate_sha,
         "acceptance_claim_ids": sorted(acceptance_claim_ids),
         "agent_completed": agent_completed,
     }
@@ -176,3 +190,55 @@ def test_completion_requires_host_evidence_not_agent_claim() -> None:
     decision = policy().evaluate([loop({"a"}, agent_completed=True)])
 
     assert decision.should_stop is False
+
+
+def test_completion_requires_passing_qa_status() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["normalized_evidence"]["qa_status"] = "fail"  # type: ignore[index]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_requires_a_fresh_host_release_gate() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["release_gate_passed"] = False
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_rejects_aggregate_only_issue_summary() -> None:
+    history = complete_history_at_loop_12()
+    history[-1].pop("issues")
+    history[-1]["issue_summary"] = {"total": 3, "open": 0, "closed": 3, "regressed": 0}
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_explicit_empty_latest_evidence_cannot_borrow_history_state() -> None:
+    decision = policy().evaluate(complete_history_at_loop_12(), latest_evidence={})
+
+    assert decision.terminal_status != "complete"
+
+
+def test_completion_rejects_a_release_gate_for_another_candidate() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["release_gate_candidate_sha"] = "b" * 40
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_unknown_explicit_failure_category_does_not_stop_the_run() -> None:
+    decision = policy().evaluate([loop()], unrecoverable_failure="candidate:build-failed")
+
+    assert decision.should_stop is False
+
+
+def test_aggregate_closed_issue_counts_do_not_create_progress() -> None:
+    history = [
+        loop(issue_summary={"closed": closed})
+        for closed in range(1, 4)
+    ]
+
+    assert policy().evaluate(history) == StopDecision(
+        True, "blocked", "no measurable evidence progress for 3 consecutive loops"
+    )
