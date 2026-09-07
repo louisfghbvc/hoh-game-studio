@@ -198,7 +198,7 @@ class GitService:
                 raise GitError("evidence paths must be inside the product repository") from error
             if not relative_path.parts or relative_path.parts[0] == ".git":
                 raise GitError("evidence paths must not select the repository or .git")
-            selected.append(relative_path.as_posix())
+            selected.append(f":(top,literal){relative_path.as_posix()}")
         return tuple(dict.fromkeys(selected))
 
     def _protected_path(self, supplied_path: str) -> tuple[str, Path]:
@@ -218,29 +218,36 @@ class GitService:
             raise ProtectedPathError("the repository root cannot be a protected path")
         return relative_path.as_posix(), absolute_path
 
-    @classmethod
-    def _recursive_digest(cls, path: Path) -> str:
+    @staticmethod
+    def _recursive_digest(path: Path) -> str:
         digest = hashlib.sha256()
+
+        def add_record(*fields: bytes) -> None:
+            for field in fields:
+                digest.update(len(field).to_bytes(8, byteorder="big"))
+                digest.update(field)
 
         def add(entry: Path, relative_name: str) -> None:
             encoded_name = relative_name.encode("utf-8", errors="surrogateescape")
             if entry.is_symlink():
-                digest.update(b"link\0" + encoded_name + b"\0")
-                digest.update(os.readlink(entry).encode("utf-8", errors="surrogateescape"))
+                target = os.readlink(entry).encode("utf-8", errors="surrogateescape")
+                add_record(b"link", encoded_name, target)
                 return
             if not entry.exists():
-                digest.update(b"missing\0" + encoded_name + b"\0")
+                add_record(b"missing", encoded_name)
                 return
             if entry.is_dir():
-                digest.update(b"directory\0" + encoded_name + b"\0")
+                add_record(b"directory-start", encoded_name)
                 for child in sorted(entry.iterdir(), key=lambda item: item.name):
                     child_name = f"{relative_name}/{child.name}" if relative_name else child.name
                     add(child, child_name)
+                add_record(b"directory-end", encoded_name)
                 return
-            digest.update(b"file\0" + encoded_name + b"\0")
+            content_digest = hashlib.sha256()
             with entry.open("rb") as protected_file:
                 for chunk in iter(lambda: protected_file.read(1024 * 1024), b""):
-                    digest.update(chunk)
+                    content_digest.update(chunk)
+            add_record(b"file", encoded_name, content_digest.digest())
 
         add(path, "")
         return digest.hexdigest()

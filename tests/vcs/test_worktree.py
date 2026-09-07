@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -81,5 +82,34 @@ def test_remove_refuses_a_path_outside_the_host_temp_root(tmp_path: Path) -> Non
 
     with pytest.raises(GitError, match=r"\.hoh[/\\]tmp"):
         QaWorktree(GitService(repo), outside).remove()
+
+    assert outside.is_dir()
+
+
+def test_remove_refuses_a_redirected_host_temp_root(tmp_path: Path) -> None:
+    repo = initialized_repo(tmp_path)
+    external = tmp_path / "external"
+    external.mkdir()
+    host_state = repo / ".hoh"
+    host_state.mkdir()
+    redirected_root = host_state / "tmp"
+    try:
+        os.symlink(external, redirected_root, target_is_directory=True)
+    except OSError as error:
+        if os.name != "nt":
+            pytest.skip(f"directory symlinks unavailable: {error}")
+        junction = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(redirected_root), str(external)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if junction.returncode != 0:
+            pytest.skip(f"directory redirects unavailable: {junction.stderr}")
+    outside = external / "qa-redirected"
+    outside.mkdir()
+
+    with pytest.raises(GitError, match="redirected|inside the product"):
+        QaWorktree(GitService(repo), redirected_root / "qa-redirected").remove()
 
     assert outside.is_dir()

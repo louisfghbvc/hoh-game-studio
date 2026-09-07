@@ -72,6 +72,12 @@ class QaWorktree:
     def _validated_path(self) -> Path:
         product = self._git.repository.resolve()
         allowed_root = (product / ".hoh" / "tmp").resolve()
+        try:
+            allowed_root.relative_to(product)
+        except ValueError as error:
+            raise GitError(
+                "QA worktree root is redirected outside the product repository"
+            ) from error
         path = (
             self._path.resolve()
             if self._path.is_absolute()

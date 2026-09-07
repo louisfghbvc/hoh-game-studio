@@ -142,6 +142,24 @@ def test_protected_snapshot_detects_created_and_deleted_entries(tmp_path: Path) 
         git.assert_snapshot_unchanged(snapshot)
 
 
+def test_protected_snapshot_records_cannot_be_absorbed_into_file_content(
+    tmp_path: Path,
+) -> None:
+    repo = initialized_repo(tmp_path)
+    git = GitService(repo)
+    protected = repo / "protected"
+    protected.mkdir()
+    (protected / "a").write_bytes(b"A")
+    (protected / "b").write_bytes(b"B")
+    snapshot = git.snapshot_paths(("protected",))
+
+    (protected / "a").write_bytes(b"Afile\0b\0B")
+    (protected / "b").unlink()
+
+    with pytest.raises(ProtectedPathError, match="protected"):
+        git.assert_snapshot_unchanged(snapshot)
+
+
 def test_evidence_commit_contains_only_selected_host_paths(tmp_path: Path) -> None:
     repo = initialized_repo(tmp_path)
     git = GitService(repo)
@@ -169,6 +187,25 @@ def test_evidence_commit_contains_only_selected_host_paths(tmp_path: Path) -> No
         "product.txt",
     ]
     assert ".hoh/private.tmp" in run_git(repo, "status", "--porcelain")
+
+
+def test_evidence_path_with_pathspec_metacharacters_is_literal(tmp_path: Path) -> None:
+    repo = initialized_repo(tmp_path)
+    git = GitService(repo)
+    git.create_run_branch("run-abc")
+    evidence = repo / ".hoh" / "evidence"
+    evidence.mkdir(parents=True)
+    selected = evidence / "result[0].json"
+    wildcard_match = evidence / "result0.json"
+    selected.write_text("selected", encoding="utf-8")
+    wildcard_match.write_text("must remain unselected", encoding="utf-8")
+
+    git.commit_evidence(1, (selected,))
+
+    committed = run_git(repo, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+    assert ".hoh/evidence/result[0].json" in committed
+    assert ".hoh/evidence/result0.json" not in committed
+    assert ".hoh/evidence/result0.json" in run_git(repo, "status", "--porcelain")
 
 
 def test_git_error_names_failed_command_without_exposing_repository_path(
