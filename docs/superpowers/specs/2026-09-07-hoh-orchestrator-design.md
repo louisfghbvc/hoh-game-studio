@@ -88,26 +88,27 @@ hoh-game-studio/
 │   ├── skills/
 │   │   ├── registry.py
 │   │   └── loader.py
+│   ├── resources/
+│   │   ├── prompts/
+│   │   │   ├── planner.md
+│   │   │   ├── developer.md
+│   │   │   └── qa.md
+│   │   ├── schemas/
+│   │   │   ├── plan.schema.json
+│   │   │   ├── developer-report.schema.json
+│   │   │   └── evidence.schema.json
+│   │   └── skills/
+│   │       ├── core/
+│   │       │   ├── bounded-planning.md
+│   │       │   └── evidence-grounded-qa.md
+│   │       └── godot/
+│   │           ├── asset-pipeline.md
+│   │           ├── ui-ux-polish.md
+│   │           ├── runtime-testing.md
+│   │           └── performance-tuning.md
 │   └── vcs/
 │       ├── git.py
 │       └── worktree.py
-├── prompts/
-│   ├── planner.md
-│   ├── developer.md
-│   └── qa.md
-├── schemas/
-│   ├── plan.schema.json
-│   ├── developer-report.schema.json
-│   └── evidence.schema.json
-├── skills/
-│   ├── core/
-│   │   ├── bounded-planning.md
-│   │   └── evidence-grounded-qa.md
-│   └── godot/
-│       ├── asset-pipeline.md
-│       ├── ui-ux-polish.md
-│       ├── runtime-testing.md
-│       └── performance-tuning.md
 ├── examples/
 │   └── minimal-godot/
 ├── tests/
@@ -115,7 +116,7 @@ hoh-game-studio/
 └── README.md
 ```
 
-Runtime dependencies will be deliberately small. The CLI uses Python 3.10 or newer, the standard library for process and TOML handling, and `jsonschema` for host-side validation. Test-only dependencies use `pytest`.
+Runtime dependencies will be deliberately small. The CLI uses Python 3.10 or newer, the standard library for process and TOML handling, and `jsonschema` for host-side validation. Test-only dependencies use `pytest`. Built-in prompts, schemas, and skills live under `src/hoh/resources/` and ship as package data so editable installs and built distributions resolve the same content.
 
 ## 6. User Interface
 
@@ -131,7 +132,7 @@ hoh report
 hoh skills list
 ```
 
-`hoh init` requires a Git repository and writes `.hoh/config.toml`, `.hoh/prd.md`, and an empty issue ledger. Model and reasoning effort are explicit required inputs so a run does not silently drift with the user's Codex defaults. Interactive initialization may prompt for them; non-interactive initialization fails if either is absent.
+`hoh init` requires a Git repository and writes `.hoh/config.toml`, `.hoh/prd.md`, `.hoh/requirements.json`, and an empty issue ledger. `prd.md` is the human-readable product source of truth; `requirements.json` assigns stable IDs to its observable acceptance claims so the host can calculate completion without trusting an agent's global completion claim. Model and reasoning effort are explicit required inputs so a run does not silently drift with the user's Codex defaults. Interactive initialization may prompt for them; non-interactive initialization fails if either is absent.
 
 `hoh doctor` checks Git, Codex, model configuration, writable state paths, adapter executable, required commands, and disk space. A missing Godot executable is a blocking diagnostic for a Godot project.
 
@@ -143,6 +144,7 @@ hoh skills list
 .hoh/
 ├── config.toml
 ├── prd.md
+├── requirements.json
 ├── issue-ledger.json
 ├── best-candidate.json
 ├── lock
@@ -183,7 +185,7 @@ Each loop follows this host-owned sequence:
 11. **Evidence normalization** validates `evidence.json`, verifies every cited path and hash, and updates the issue ledger.
 12. **Loop closure** records progress, updates the best verified candidate when justified, writes the immutable receipt, and evaluates stop conditions.
 
-The next Planner receives the PRD, normalized evidence, issue ledger, and a deterministic project summary. It does not receive an unbounded prior conversation or treat the previous plan as a persistent source of truth.
+The next Planner receives the PRD, required-claim registry, normalized evidence, issue ledger, and a deterministic project summary. It does not receive an unbounded prior conversation or treat the previous plan as a persistent source of truth.
 
 ## 9. Role Contracts
 
@@ -237,7 +239,7 @@ Skill instructions cannot override host permissions, protected paths, schemas, b
 
 `CommandAdapter` runs configured commands and collects configured files. It is the portable reference implementation and test fixture.
 
-`GodotAdapter` accepts a configured Godot executable path and commands for headless import, boot, test scenes, deterministic input replay, telemetry collection, and screenshots. It never returns success when the executable is absent, a process times out, an expected record is missing, or runtime error patterns are present. Generated caches and temporary artifacts are written outside the candidate or removed with the disposable QA worktree.
+`GodotAdapter` accepts a configured Godot command prefix (normally one executable path; tests may use a Python interpreter plus fixture script) and commands for headless import, boot, test scenes, deterministic input replay, telemetry collection, and screenshots. It never returns success when the executable is absent, a process times out, an expected record is missing, or runtime error patterns are present. Generated caches and temporary artifacts are written outside the candidate or removed with the disposable QA worktree.
 
 The local machine currently has Codex CLI 0.104.0, Python 3.13.1, Node.js 22.14.0, and Git 2.54.0. Godot is not installed. Godot-specific real E2E verification is therefore an explicit later prerequisite, while adapter failure and contract behavior can be tested with a fake executable.
 
@@ -251,7 +253,7 @@ Failed candidates remain in history. Rollback means creating a new branch or com
 
 ## 13. Evidence and Issue Semantics
 
-Normalized evidence contains:
+The machine-readable requirement registry contains a schema version and stable claim records with `id`, `description`, and `required`. `hoh doctor` blocks a run until the registry contains at least one required claim. Normalized evidence contains:
 
 - Run and loop identifiers.
 - Candidate SHA and artifact tree hash.
@@ -274,6 +276,8 @@ max_role_retries = 1
 max_consecutive_no_progress = 3
 max_consecutive_same_blocker = 3
 role_timeout_minutes = 45
+max_total_tokens = 5000000
+max_elapsed_minutes = 480
 ```
 
 Failures are classified as:
@@ -291,7 +295,7 @@ Resume starts at the first incomplete phase after validating all preceding artif
 A product is complete only when the latest candidate:
 
 1. Passes every required deterministic adapter check.
-2. Has verified evidence for every required PRD claim.
+2. Has verified evidence for every claim marked required in `.hoh/requirements.json`.
 3. Has no open blocker or major issue.
 4. Passes a fresh, full release QA invocation and end-to-end gate.
 
@@ -339,7 +343,7 @@ Godot adapter contract tests use a fake executable by default. A real minimal Go
 
 The rewrite is acceptable when:
 
-1. `hoh init` initializes a separate Git product with explicit backend, model, reasoning effort, and adapter settings.
+1. `hoh init` initializes a separate Git product with explicit backend, model, reasoning effort, adapter settings, human-readable PRD, and machine-readable requirement registry.
 2. `hoh doctor` distinguishes healthy, blocked, and misconfigured prerequisites.
 3. `hoh run` can complete a full three-role loop with structured outputs and candidate-bound evidence.
 4. Planner and QA run read-only; Developer runs workspace-write; protected state remains host-owned.
