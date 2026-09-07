@@ -171,11 +171,14 @@ def test_prepare_candidate_handles_deletion_and_literal_special_character_path(
     git.create_run_branch("run-abc")
     deleted.unlink()
     special.write_text("literal path", encoding="utf-8")
+    changed_paths = ("delete-me.txt", "feature[1].txt")
+    manifest = git.candidate_mutation_manifest(git.head_sha(), changed_paths)
 
     prepared = git.prepare_candidate(
         1,
         "literal candidate",
-        ("delete-me.txt", "feature[1].txt"),
+        changed_paths,
+        mutation_manifest=manifest,
     )
     git.land_prepared_commit(prepared)
 
@@ -183,6 +186,47 @@ def test_prepare_candidate_handles_deletion_and_literal_special_character_path(
     assert "delete-me.txt" not in committed
     assert "feature[1].txt" in committed
     assert run_git(repo, "show", "HEAD:feature[1].txt") == "literal path"
+
+
+def test_prepare_candidate_rejects_staged_mode_outside_durable_manifest(
+    tmp_path: Path,
+) -> None:
+    repo = initialized_repo(tmp_path)
+    git = GitService(repo)
+    git.create_run_branch("run-abc")
+    parent = git.head_sha()
+    (repo / "product.txt").write_text("changed", encoding="utf-8")
+    manifest = git.candidate_mutation_manifest(parent, ("product.txt",))
+    run_git_command = git._run
+    changed_mode = False
+
+    def alter_staged_mode(arguments, **kwargs):
+        nonlocal changed_mode
+        result = run_git_command(arguments, **kwargs)
+        environment = kwargs.get("env") or {}
+        if (
+            not changed_mode
+            and tuple(arguments[:2]) == ("add", "--all")
+            and "GIT_AUTHOR_NAME" in environment
+        ):
+            changed_mode = True
+            run_git_command(
+                ("update-index", "--chmod=+x", "--", "product.txt"),
+                env=environment,
+            )
+        return result
+
+    git._run = alter_staged_mode  # type: ignore[method-assign]
+
+    with pytest.raises(GitError, match="manifest|staged|mode|type"):
+        git.prepare_candidate(
+            1,
+            "mode-bound candidate",
+            ("product.txt",),
+            mutation_manifest=manifest,
+        )
+
+    assert changed_mode is True
 
 
 def test_candidate_commit_is_rejected_on_the_default_branch(tmp_path: Path) -> None:

@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shutil
-import stat
 import tempfile
 import time
 import uuid
@@ -480,7 +479,10 @@ class HoHOrchestrator:
                 )
             try:
                 prepared = self.git.prepare_candidate(
-                    loop_index, summary, tuple(changed_paths)
+                    loop_index,
+                    summary,
+                    tuple(changed_paths),
+                    mutation_manifest=mutation_manifest,
                 )
             except GitError as error:
                 raise StateConflictError(
@@ -1834,12 +1836,14 @@ class HoHOrchestrator:
     def _product_mutation_manifest(
         self, base_sha: str, paths: Sequence[str]
     ) -> dict[str, object]:
-        entries = [self._product_mutation_entry(path) for path in paths]
-        document: dict[str, object] = {
-            "schema_version": 1,
-            "base_sha": base_sha,
-            "entries": entries,
-        }
+        try:
+            document = self.git.candidate_mutation_manifest(
+                base_sha, tuple(paths)
+            )
+        except GitError as error:
+            raise StateConflictError(
+                "product mutations could not be captured in a durable Git manifest"
+            ) from error
         self._validate_product_mutation_manifest(
             document,
             expected_base_sha=base_sha,
@@ -1863,10 +1867,15 @@ class HoHOrchestrator:
             raise StateConflictError(
                 "current product mutation paths do not match the durable manifest"
             )
-        current_entries = [
-            self._product_mutation_entry(path) for path in current_paths
-        ]
-        if current_entries != entries:
+        try:
+            current_manifest = self.git.candidate_mutation_manifest(
+                base_sha, current_paths
+            )
+        except GitError as error:
+            raise StateConflictError(
+                "current product mutations could not be validated against Git"
+            ) from error
+        if current_manifest != dict(manifest):
             raise StateConflictError(
                 "current product mutation content does not match the durable manifest"
             )
@@ -1904,6 +1913,7 @@ class HoHOrchestrator:
                 "path",
                 "type",
                 "sha256",
+                "mode",
             }:
                 raise StateConflictError(
                     "durable product mutation manifest entry is malformed"
@@ -1911,22 +1921,38 @@ class HoHOrchestrator:
             path = raw_entry.get("path")
             entry_type = raw_entry.get("type")
             digest = raw_entry.get("sha256")
+            mode = raw_entry.get("mode")
             if not isinstance(path, str):
                 raise StateConflictError(
                     "durable product mutation manifest path is malformed"
                 )
             self._product_path(path)
             if entry_type == "deleted":
-                if digest is not None:
+                if digest is not None or mode is not None:
                     raise StateConflictError(
-                        "durable deleted product mutation has a content hash"
+                        "durable deleted product mutation has an index entry"
                     )
-            elif entry_type in {"file", "symlink"}:
+            elif entry_type == "file":
                 if not isinstance(digest, str) or re.fullmatch(
                     r"[0-9a-f]{64}", digest
                 ) is None:
                     raise StateConflictError(
                         "durable product mutation content hash is malformed"
+                    )
+                if not isinstance(mode, str) or mode not in {"100644", "100755"}:
+                    raise StateConflictError(
+                        "durable product mutation file mode is malformed"
+                    )
+            elif entry_type == "symlink":
+                if not isinstance(digest, str) or re.fullmatch(
+                    r"[0-9a-f]{64}", digest
+                ) is None:
+                    raise StateConflictError(
+                        "durable product mutation content hash is malformed"
+                    )
+                if mode != "120000":
+                    raise StateConflictError(
+                        "durable product mutation symlink mode is malformed"
                     )
             else:
                 raise StateConflictError(
@@ -1943,33 +1969,6 @@ class HoHOrchestrator:
                 "durable product mutation manifest path set is ambiguous"
             )
         return entries
-
-    def _product_mutation_entry(self, relative: str) -> dict[str, object]:
-        path = self._product_path(relative)
-        if path.is_symlink():
-            target = os.readlink(path).encode("utf-8", errors="surrogateescape")
-            return {
-                "path": relative,
-                "type": "symlink",
-                "sha256": hashlib.sha256(target).hexdigest(),
-            }
-        if not path.exists():
-            return {"path": relative, "type": "deleted", "sha256": None}
-        try:
-            mode = path.stat().st_mode
-        except OSError as error:
-            raise StateConflictError(
-                "product mutation cannot be inspected"
-            ) from error
-        if not stat.S_ISREG(mode):
-            raise StateConflictError(
-                "product mutation must be a regular file, symlink, or deletion"
-            )
-        return {
-            "path": relative,
-            "type": "file",
-            "sha256": _file_sha256(path),
-        }
 
     def _product_path(self, relative: str) -> Path:
         if not isinstance(relative, str) or not relative or "\\" in relative:

@@ -238,6 +238,98 @@ def test_resume_rejects_same_path_content_changed_after_development_journal(
     assert count_candidate_commits(project) == 0
 
 
+def test_candidate_prepare_rejects_bytes_mutated_during_literal_staging(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    run_git_command = services.git._run
+    mutated = False
+
+    def mutate_at_add(arguments, **kwargs):
+        nonlocal mutated
+        environment = kwargs.get("env") or {}
+        if (
+            not mutated
+            and tuple(arguments[:2]) == ("add", "--all")
+            and "GIT_AUTHOR_NAME" in environment
+        ):
+            mutated = True
+            (project / "product.txt").write_text(
+                "mutated at staging boundary\n", encoding="utf-8"
+            )
+        return run_git_command(arguments, **kwargs)
+
+    services.git._run = mutate_at_add  # type: ignore[method-assign]
+
+    with pytest.raises(StateConflictError, match="manifest|candidate|staged|content"):
+        services.orchestrator.run(max_loops=1)
+
+    assert mutated is True
+    assert count_candidate_commits(project) == 0
+
+
+def test_candidate_prepare_rejects_deleted_path_recreated_during_staging(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    obsolete = project / "obsolete.txt"
+    obsolete.write_text("tracked obsolete content\n", encoding="utf-8")
+    run_git(project, "add", "obsolete.txt")
+    run_git(
+        project,
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-m",
+        "add obsolete fixture",
+    )
+
+    def delete_obsolete(request) -> None:
+        developer_change(request)
+        (request.workspace / "obsolete.txt").unlink()
+
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=delete_obsolete),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    run_git_command = services.git._run
+    recreated = False
+
+    def recreate_at_add(arguments, **kwargs):
+        nonlocal recreated
+        environment = kwargs.get("env") or {}
+        if (
+            not recreated
+            and tuple(arguments[:2]) == ("add", "--all")
+            and "GIT_AUTHOR_NAME" in environment
+        ):
+            recreated = True
+            obsolete.write_text("recreated at staging boundary\n", encoding="utf-8")
+        return run_git_command(arguments, **kwargs)
+
+    services.git._run = recreate_at_add  # type: ignore[method-assign]
+
+    with pytest.raises(StateConflictError, match="manifest|candidate|staged|delet"):
+        services.orchestrator.run(max_loops=1)
+
+    assert recreated is True
+    assert count_candidate_commits(project) == 0
+
+
 def test_resume_recovers_evidence_commit_that_landed_before_closure_journal(
     tmp_path: Path,
 ) -> None:

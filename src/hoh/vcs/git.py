@@ -6,7 +6,7 @@ import hashlib
 import os
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -33,6 +33,14 @@ class PreparedCommit:
     parent_sha: str
     commit_sha: str
     tree_sha: str
+
+
+@dataclass(frozen=True)
+class _CandidateMutation:
+    path: str
+    entry_type: str
+    sha256: str | None
+    mode: str | None
 
 
 class GitService:
@@ -84,6 +92,49 @@ class GitService:
         )
         return tuple(sorted(set(tracked) | set(untracked)))
 
+    def candidate_mutation_manifest(
+        self, base_sha: str, paths: tuple[str, ...]
+    ) -> dict[str, object]:
+        """Describe the exact Git entries produced by staging product mutations."""
+
+        if self.rev_parse_in(self._repository, f"{base_sha}^{{commit}}") != base_sha:
+            raise GitError("candidate mutation base must be a full commit identity")
+        selected_paths = self._candidate_paths(paths)
+        current_paths = tuple(
+            path
+            for path in self.changed_paths(base_sha)
+            if path != ".hoh" and not path.startswith(".hoh/")
+        )
+        if current_paths != selected_paths:
+            raise GitError(
+                "candidate mutation paths do not match the literal manifest path set"
+            )
+        pathspecs = tuple(f":(top,literal){path}" for path in selected_paths)
+        index_path = self._temporary_index_path()
+        environment = {"GIT_INDEX_FILE": str(index_path)}
+        try:
+            self._run(("read-tree", base_sha), env=environment)
+            self._run(("add", "--all", "--", *pathspecs), env=environment)
+            mutations = self._staged_candidate_mutations(
+                base_sha, environment, selected_paths
+            )
+        finally:
+            index_path.unlink(missing_ok=True)
+            index_path.with_name(index_path.name + ".lock").unlink(missing_ok=True)
+        return {
+            "schema_version": 1,
+            "base_sha": base_sha,
+            "entries": [
+                {
+                    "path": mutation.path,
+                    "type": mutation.entry_type,
+                    "sha256": mutation.sha256,
+                    "mode": mutation.mode,
+                }
+                for mutation in mutations
+            ],
+        }
+
     def snapshot_paths(self, paths: tuple[str, ...]) -> dict[str, str]:
         """Hash each protected path recursively, including absent paths and empty directories."""
 
@@ -121,6 +172,8 @@ class GitService:
         loop_index: int,
         summary: str,
         paths: tuple[str, ...] | None = None,
+        *,
+        mutation_manifest: Mapping[str, object] | None = None,
     ) -> PreparedCommit:
         """Create the exact candidate commit object without moving the run branch."""
 
@@ -134,14 +187,29 @@ class GitService:
                 "protected path is staged: " + ", ".join(staged_host_state)
             )
         parent_sha = self.head_sha()
+        expected_mutations = (
+            self._candidate_mutations(mutation_manifest, parent_sha)
+            if mutation_manifest is not None
+            else None
+        )
         current_paths = tuple(
             path
             for path in self.changed_paths(parent_sha)
             if path != ".hoh" and not path.startswith(".hoh/")
         )
         selected_paths = self._candidate_paths(
-            current_paths if paths is None else paths
+            (
+                tuple(mutation.path for mutation in expected_mutations)
+                if paths is None and expected_mutations is not None
+                else current_paths if paths is None else paths
+            )
         )
+        if expected_mutations is not None and selected_paths != tuple(
+            mutation.path for mutation in expected_mutations
+        ):
+            raise GitError(
+                "candidate mutation manifest does not match the literal path set"
+            )
         if current_paths != selected_paths:
             raise GitError(
                 "candidate mutation paths do not match the validated literal path set"
@@ -156,6 +224,16 @@ class GitService:
             self._DEVELOPER_NAME,
             self._DEVELOPER_EMAIL,
             production_pathspec,
+            staged_validator=(
+                None
+                if expected_mutations is None
+                else lambda staged_parent, environment: self._assert_staged_candidate(
+                    parent_sha,
+                    staged_parent,
+                    environment,
+                    expected_mutations,
+                )
+            ),
         )
 
     def commit_evidence(self, loop_index: int, paths: tuple[Path, ...]) -> str:
@@ -261,6 +339,7 @@ class GitService:
         author_name: str,
         author_email: str,
         paths: Sequence[str],
+        staged_validator: Callable[[str, Mapping[str, str]], None] | None = None,
     ) -> PreparedCommit:
         parent_sha = self.head_sha()
         parent_tree = self.rev_parse_in(self._repository, f"{parent_sha}^{{tree}}")
@@ -275,6 +354,8 @@ class GitService:
         try:
             self._run(("read-tree", parent_sha), env=environment)
             self._run(("add", "--all", "--", *paths), env=environment)
+            if staged_validator is not None:
+                staged_validator(parent_sha, environment)
             tree_sha = self._run(("write-tree",), env=environment).strip()
             if tree_sha == parent_tree:
                 raise GitError(f"prepared {kind} commit has no changes")
@@ -354,6 +435,151 @@ class GitService:
         if len(selected) != len(set(selected)):
             raise GitError("candidate mutation path set contains duplicates")
         return tuple(sorted(selected))
+
+    def _candidate_mutations(
+        self, manifest: Mapping[str, object], parent_sha: str
+    ) -> tuple[_CandidateMutation, ...]:
+        if (
+            not isinstance(manifest, Mapping)
+            or set(manifest) != {"schema_version", "base_sha", "entries"}
+            or isinstance(manifest.get("schema_version"), bool)
+            or manifest.get("schema_version") != 1
+            or manifest.get("base_sha") != parent_sha
+        ):
+            raise GitError("candidate mutation manifest is malformed or has a wrong parent")
+        raw_entries = manifest.get("entries")
+        if not isinstance(raw_entries, list):
+            raise GitError("candidate mutation manifest entries are malformed")
+        mutations: list[_CandidateMutation] = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, Mapping) or set(raw_entry) != {
+                "path",
+                "type",
+                "sha256",
+                "mode",
+            }:
+                raise GitError("candidate mutation manifest entry is malformed")
+            path = raw_entry.get("path")
+            entry_type = raw_entry.get("type")
+            digest = raw_entry.get("sha256")
+            mode = raw_entry.get("mode")
+            if not isinstance(path, str):
+                raise GitError("candidate mutation manifest path is malformed")
+            self._candidate_paths((path,))
+            if entry_type == "deleted":
+                if digest is not None or mode is not None:
+                    raise GitError(
+                        "deleted candidate mutation must not have an index entry"
+                    )
+            elif entry_type == "file":
+                if not self._is_sha256(digest):
+                    raise GitError("candidate mutation content hash is malformed")
+                if not isinstance(mode, str) or mode not in {"100644", "100755"}:
+                    raise GitError("candidate file mode is malformed")
+            elif entry_type == "symlink":
+                if not self._is_sha256(digest):
+                    raise GitError("candidate mutation content hash is malformed")
+                if mode != "120000":
+                    raise GitError("candidate symlink mode is malformed")
+            else:
+                raise GitError("candidate mutation type is malformed")
+            mutations.append(
+                _CandidateMutation(path, str(entry_type), digest, mode)
+            )
+        paths = tuple(mutation.path for mutation in mutations)
+        if paths != self._candidate_paths(paths):
+            raise GitError("candidate mutation manifest path set is ambiguous")
+        return tuple(mutations)
+
+    def _assert_staged_candidate(
+        self,
+        expected_parent_sha: str,
+        parent_sha: str,
+        environment: Mapping[str, str],
+        mutations: tuple[_CandidateMutation, ...],
+    ) -> None:
+        if parent_sha != expected_parent_sha:
+            raise GitError(
+                "staged candidate parent does not match the durable mutation manifest"
+            )
+        staged = self._staged_candidate_mutations(
+            parent_sha,
+            environment,
+            tuple(mutation.path for mutation in mutations),
+        )
+        if staged != mutations:
+            raise GitError(
+                "staged candidate entries do not match the durable mutation manifest"
+            )
+
+    def _staged_candidate_mutations(
+        self,
+        parent_sha: str,
+        environment: Mapping[str, str],
+        expected_paths: tuple[str, ...],
+    ) -> tuple[_CandidateMutation, ...]:
+        staged_paths = tuple(
+            sorted(
+                set(
+                    self._split_nul(
+                        self._run(
+                            (
+                                "diff",
+                                "--cached",
+                                "--name-only",
+                                "--relative",
+                                "-z",
+                                parent_sha,
+                                "--",
+                            ),
+                            env=environment,
+                        )
+                    )
+                )
+            )
+        )
+        if staged_paths != expected_paths:
+            raise GitError(
+                "staged candidate paths do not match the durable mutation manifest"
+            )
+        mutations: list[_CandidateMutation] = []
+        for path in expected_paths:
+            pathspec = f":(top,literal){path}"
+            records = self._split_nul(
+                self._run(("ls-files", "--stage", "-z", "--", pathspec), env=environment)
+            )
+            if not records:
+                mutations.append(_CandidateMutation(path, "deleted", None, None))
+                continue
+            if len(records) != 1 or "\t" not in records[0]:
+                raise GitError("staged candidate entry is missing or ambiguous")
+            metadata, staged_path = records[0].split("\t", 1)
+            fields = metadata.split()
+            if len(fields) != 3 or fields[2] != "0" or staged_path != path:
+                raise GitError("staged candidate entry identity is malformed")
+            mode, object_id, _ = fields
+            staged_type = (
+                "file"
+                if mode in {"100644", "100755"}
+                else "symlink" if mode == "120000" else "unsupported"
+            )
+            if staged_type == "unsupported":
+                raise GitError(
+                    "staged candidate entry type is unsupported"
+                )
+            digest = hashlib.sha256(
+                self._run_bytes(("cat-file", "blob", object_id), env=environment)
+            ).hexdigest()
+            mutations.append(_CandidateMutation(path, staged_type, digest, mode))
+        return tuple(mutations)
+
+    @staticmethod
+    def _is_sha256(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
 
     def _protected_path(self, supplied_path: str) -> tuple[str, Path]:
         path = Path(supplied_path)
@@ -457,6 +683,36 @@ class GitService:
         if completed.returncode != 0:
             command_name = self._command_name(args)
             detail = completed.stderr.strip() or completed.stdout.strip()
+            detail = self._sanitize(detail, working_directory)
+            if not detail:
+                detail = f"exit status {completed.returncode}"
+            raise GitError(f"git {command_name} failed: {detail}")
+        return completed.stdout
+
+    def _run_bytes(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> bytes:
+        working_directory = self._repository if cwd is None else Path(cwd)
+        environment = None
+        if env is not None:
+            environment = os.environ.copy()
+            environment.update(env)
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=working_directory,
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+        if completed.returncode != 0:
+            command_name = self._command_name(args)
+            detail = (completed.stderr or completed.stdout).decode(
+                errors="replace"
+            ).strip()
             detail = self._sanitize(detail, working_directory)
             if not detail:
                 detail = f"exit status {completed.returncode}"
