@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HoH planner response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "iteration",
+    "objective",
+    "priorities",
+    "preservation_constraints",
+    "acceptance_gate"
+  ],
+  "properties": {
+    "iteration": {"type": "integer", "minimum": 1},
+    "objective": {"type": "string", "minLength": 1},
+    "priorities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "items": {"$ref": "#/$defs/priority"}
+    },
+    "preservation_constraints": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "acceptance_gate": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "$defs": {
+    "priority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "implementation_target",
+        "acceptance_claims",
+        "source_gap_ids"
+      ],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "implementation_target": {"type": "string", "minLength": 1},
+        "acceptance_claims": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "source_gap_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}
