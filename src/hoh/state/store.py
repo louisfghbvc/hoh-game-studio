@@ -156,7 +156,12 @@ class StateStore:
     def _phase_path(self, run_id: str, loop_index: int) -> Path:
         if loop_index < 1:
             raise ValueError("loop_index must be positive")
-        return self._run_directory(run_id) / "loops" / f"{loop_index}.json"
+        return (
+            self._run_directory(run_id)
+            / "loops"
+            / f"loop-{loop_index:04d}"
+            / "phase-state.json"
+        )
 
     @staticmethod
     def _normalize_payload(payload: Mapping[str, object]) -> dict:

@@ -60,6 +60,9 @@ def test_completed_phases_are_journaled_in_phase_order(tmp_path: Path) -> None:
 
     assert list(state["completed"]) == ["planning", "qa"]
     assert store.first_incomplete_phase("run-1", 1) is Phase.PREFLIGHT
+    assert (
+        tmp_path / ".hoh" / "runs" / "run-1" / "loops" / "loop-0001" / "phase-state.json"
+    ).is_file()
 
 
 def test_second_lock_is_rejected(tmp_path: Path) -> None:
