@@ -3,4 +3,11 @@
 *.log
 build/
 .worktrees/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+dist/
+*.egg-info/
 
