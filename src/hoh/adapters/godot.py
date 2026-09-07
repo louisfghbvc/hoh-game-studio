@@ -191,13 +191,15 @@ def _contained_glob(project: Path, pattern: str) -> tuple[Path, ...]:
             for path in project.glob(pattern)
             if path.is_file() and path.resolve().is_relative_to(project)
         )
-    except (OSError, ValueError):
+    except (NotImplementedError, OSError, ValueError):
         return ()
 
 
 def _is_safe_glob(pattern: str) -> bool:
+    if not isinstance(pattern, str) or not pattern or "\x00" in pattern:
+        return False
     path = Path(pattern)
-    return bool(pattern) and not path.is_absolute() and ".." not in path.parts
+    return not path.drive and not path.root and ".." not in path.parts
 
 
 def _bundle_status(results: Sequence[CheckResult]) -> str:

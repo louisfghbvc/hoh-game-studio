@@ -166,6 +166,30 @@ def test_missing_required_evidence_fails_and_matching_evidence_is_collected(
     assert set(artifacts) == {"artifacts/evidence/telemetry.jsonl"}
 
 
+@pytest.mark.parametrize("pattern", ("C:*.jsonl", "invalid\x00glob"))
+def test_invalid_required_evidence_glob_fails_without_crashing(
+    tmp_path: Path, fake_godot: Path, pattern: str
+) -> None:
+    """Passing an invalid glob to pathlib must not crash Godot checking or collection."""
+    project = copy_minimal_project(tmp_path)
+    context = AdapterContext(project, tmp_path / "out")
+    adapter = GodotAdapter(
+        command=(sys.executable, str(fake_godot)),
+        project_subdir=".",
+        required_evidence_globs=(pattern,),
+    )
+
+    bundle = adapter.check(context, {})
+
+    assert bundle.status == "fail"
+    assert next(
+        result
+        for result in bundle.results
+        if result.check_id == f"godot:evidence:{pattern}"
+    ).status == "fail"
+    assert adapter.collect(context, bundle) == {}
+
+
 def copy_minimal_project(destination: Path) -> Path:
     project = destination / "minimal-godot"
     shutil.copytree(Path(__file__).parents[2] / "examples" / "minimal-godot", project)
