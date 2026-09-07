@@ -9,13 +9,13 @@ import pytest
 
 import hoh.cli as cli
 from hoh.backends.base import BackendProtocolError
-from hoh.backends.fake import FakeAgentBackend
+from hoh.backends.fake import FakeAgentBackend, FakeResponse
 from hoh.config import ConfigError, initialize_project, load_config
 from hoh.orchestrator import PreflightError
 from hoh.prompts import PromptRenderingError
 from hoh.state.evidence import EvidenceBindingError
 from hoh.state.store import RunLockedError, StateConflictError
-from hoh.vcs.git import ProtectedPathError
+from hoh.vcs.git import GitService, ProtectedPathError
 
 
 def _git(project: Path, *arguments: str) -> str:
@@ -130,7 +130,8 @@ class _StubOrchestrator:
         }
         self.error = error
         self.run_calls: list[int | None] = []
-        self.resume_calls = 0
+        self.resume_calls: list[str | None] = []
+        self.inspect_result: tuple[Path, dict[str, object]] | None = None
 
     def run(self, max_loops: int | None = None) -> dict[str, object]:
         self.run_calls.append(max_loops)
@@ -138,11 +139,24 @@ class _StubOrchestrator:
             raise self.error
         return dict(self.result)
 
-    def resume(self) -> dict[str, object]:
-        self.resume_calls += 1
+    def resume(self, expected_run_id: str | None = None) -> dict[str, object]:
+        self.resume_calls.append(expected_run_id)
         if self.error is not None:
             raise self.error
+        if expected_run_id is not None and self.result.get("run_id") != expected_run_id:
+            raise ConfigError(
+                "--run-id must match the newest resumable run; "
+                f"newest resumable run is {self.result.get('run_id')}"
+            )
         return dict(self.result)
+
+    def inspect_latest(self) -> tuple[Path, dict[str, object]]:
+        if self.error is not None:
+            raise self.error
+        if self.inspect_result is None:
+            raise AssertionError("no inspection result configured")
+        run_dir, result = self.inspect_result
+        return run_dir, dict(result)
 
 
 def _inject_orchestrator(
@@ -153,7 +167,9 @@ def _inject_orchestrator(
         "build_services",
         lambda config, backend_name="codex-exec": SimpleNamespace(
             orchestrator=orchestrator,
+            backend=object(),
             adapter=SimpleNamespace(doctor=lambda project: ()),
+            git=GitService(config.project),
         ),
         raising=False,
     )
@@ -219,17 +235,27 @@ def test_malformed_adapter_configuration_is_a_usage_error(
 
 
 def test_status_json_is_machine_readable_and_contains_no_human_text(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     project = _initialized_project(tmp_path)
     candidate = "a" * 40
-    _write_run(
-        project,
-        "run-complete",
-        status="complete",
-        updated_at="2026-09-08T01:02:03+00:00",
-        candidate=candidate,
+    run_dir = project / ".hoh" / "runs" / "run-complete"
+    orchestrator = _StubOrchestrator()
+    orchestrator.inspect_result = (
+        run_dir,
+        {
+            "run_id": "run-complete",
+            "status": "complete",
+            "terminal_status": "complete",
+            "reason": "all required claims verified",
+            "current_candidate": candidate,
+            "best_candidate": candidate,
+            "guidance": f"git merge {candidate}",
+        },
     )
+    _inject_orchestrator(monkeypatch, orchestrator)
 
     assert cli.main(["status", "--project", str(project), "--json"]) == 0
     output = capsys.readouterr()
@@ -258,15 +284,24 @@ def test_status_json_protocol_error_writes_no_partial_stdout(
 
 
 def test_report_is_regenerated_from_structured_state(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     project = _initialized_project(tmp_path)
-    run_dir = _write_run(
-        project,
-        "run-blocked",
-        status="blocked",
-        updated_at="2026-09-08T01:02:03+00:00",
+    run_dir = project / ".hoh" / "runs" / "run-blocked"
+    run_dir.mkdir(parents=True)
+    orchestrator = _StubOrchestrator()
+    orchestrator.inspect_result = (
+        run_dir,
+        {
+            "run_id": "run-blocked",
+            "status": "blocked",
+            "terminal_status": "blocked",
+            "reason": "fixture decision",
+        },
     )
+    _inject_orchestrator(monkeypatch, orchestrator)
     (run_dir / "run-summary.md").write_text("untrusted stale prose\n", encoding="utf-8")
 
     assert cli.main(["report", "--project", str(project)]) == 0
@@ -434,6 +469,108 @@ def test_run_surfaces_stale_lock_without_removing_or_starting(
     assert orchestrator.run_calls == []
 
 
+def test_run_blocks_on_project_diagnostics_before_creating_a_run_or_calling_backend(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = _initialized_project(tmp_path)
+    (project / ".hoh" / "requirements.json").write_text(
+        '{"schema_version": 1, "claims": []}\n', encoding="utf-8"
+    )
+    _git(project, "add", ".hoh/requirements.json")
+    _git(
+        project,
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-m",
+        "empty requirements",
+    )
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(
+                {
+                    "iteration": 1,
+                    "objective": "should not run",
+                    "priorities": [],
+                    "preservation_constraints": [],
+                    "acceptance_gate": [],
+                }
+            )
+        ]
+    )
+
+    assert cli.main(["run", "--project", str(project)], backend=backend) == 3
+
+    output = capsys.readouterr()
+    assert "requirements:required-claim" in output.out
+    assert output.err == ""
+    assert backend.requests == []
+    assert _git(project, "branch", "--show-current") == "main"
+    assert tuple((project / ".hoh" / "runs").iterdir()) == ()
+
+
+def test_run_keyboard_interrupt_returns_structured_cancelled_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = _initialized_project(tmp_path)
+
+    def cancel(_request) -> None:
+        raise KeyboardInterrupt()
+
+    backend = FakeAgentBackend([FakeResponse({}, on_run=cancel)])
+
+    assert cli.main(["run", "--project", str(project)], backend=backend) == 130
+
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert "Status: cancelled" in output.out
+    assert "Reason: run cancelled by user" in output.out
+    run_dir = next((project / ".hoh" / "runs").iterdir())
+    state = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert state["status"] == "cancelled"
+    assert (run_dir / "run-summary.md").is_file()
+
+
+@pytest.mark.parametrize(
+    "requirements",
+    [
+        {
+            "schema_version": 999,
+            "claims": [
+                {"id": "claim-main", "description": "Main", "required": True}
+            ],
+        },
+        {
+            "schema_version": 1,
+            "claims": [{"description": "Main", "required": True}],
+        },
+        {
+            "schema_version": 1,
+            "claims": [{"id": "claim-main", "required": True}],
+        },
+    ],
+)
+def test_doctor_blocks_requirements_that_fail_the_packaged_schema(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    requirements: dict[str, object],
+) -> None:
+    project = _initialized_project(tmp_path)
+    (project / ".hoh" / "requirements.json").write_text(
+        json.dumps(requirements) + "\n", encoding="utf-8"
+    )
+
+    assert cli.main(["doctor", "--project", str(project)]) == 3
+
+    output = capsys.readouterr()
+    assert "requirements:schema" in output.out
+    assert output.err == ""
+
+
 def test_resume_run_id_must_match_newest_durable_resumable_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -469,7 +606,7 @@ def test_resume_run_id_must_match_newest_durable_resumable_run(
     rejected = capsys.readouterr()
     assert rejected.out == ""
     assert "newest resumable run is run-new" in rejected.err
-    assert orchestrator.resume_calls == 0
+    assert orchestrator.resume_calls == ["run-old"]
 
     assert (
         cli.main(["resume", "--project", str(project), "--run-id", "run-new"])
@@ -478,7 +615,7 @@ def test_resume_run_id_must_match_newest_durable_resumable_run(
     accepted = capsys.readouterr()
     assert accepted.err == ""
     assert "Status: budget_exhausted" in accepted.out
-    assert orchestrator.resume_calls == 1
+    assert orchestrator.resume_calls == ["run-old", "run-new"]
 
 
 def test_resume_without_run_id_delegates_selection_to_orchestrator(
@@ -490,10 +627,10 @@ def test_resume_without_run_id_delegates_selection_to_orchestrator(
     _inject_orchestrator(monkeypatch, orchestrator)
 
     assert cli.main(["resume", "--project", str(project)]) == 0
-    assert orchestrator.resume_calls == 1
+    assert orchestrator.resume_calls == [None]
 
 
-def test_resume_run_id_is_not_silently_discarded_if_selected_run_changes(
+def test_resume_run_id_is_passed_to_orchestrator_and_never_silently_discarded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -517,12 +654,12 @@ def test_resume_run_id_is_not_silently_discarded_if_selected_run_changes(
 
     assert (
         cli.main(["resume", "--project", str(project), "--run-id", "run-new"])
-        == 5
+        == 2
     )
     output = capsys.readouterr()
     assert output.out == ""
-    assert "resumed run does not match --run-id" in output.err
-    assert orchestrator.resume_calls == 1
+    assert "newest resumable run is run-different" in output.err
+    assert orchestrator.resume_calls == ["run-new"]
 
 
 def test_skills_list_uses_packaged_registry(

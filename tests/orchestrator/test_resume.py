@@ -6,6 +6,7 @@ import pytest
 
 from hoh.backends import BackendTimeout, FakeAgentBackend, FakeResponse
 from hoh.models import Role
+from hoh.orchestrator import ResumeError
 from hoh.policy import StopPolicy
 from hoh.state.evidence import EvidenceBindingError
 from hoh.state.store import StateConflictError
@@ -38,6 +39,32 @@ def test_resume_does_not_repeat_completed_developer(tmp_path: Path) -> None:
     assert result["current_candidate"] == original_candidate
     assert count_candidate_commits(project) == 1
     assert not any((project / ".hoh" / "tmp").glob("qa-*"))
+
+
+def test_expected_resume_id_is_checked_inside_the_product_lock_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    project, services = crashed_after_candidate_fixture(tmp_path)
+    run_path = next((project / ".hoh" / "runs").glob("*/run.json"))
+    state_before = run_path.read_bytes()
+    head_before = services.git.head_sha()
+    selected = services.orchestrator._latest_resumable_run
+
+    def selected_while_locked():
+        assert (project / ".hoh" / "lock").is_file()
+        return selected()
+
+    services.orchestrator._latest_resumable_run = (  # type: ignore[method-assign]
+        selected_while_locked
+    )
+
+    with pytest.raises(ResumeError, match="newest resumable run"):
+        services.orchestrator.resume(expected_run_id="not-the-newest-run")
+
+    assert services.backend.requests == []
+    assert services.git.head_sha() == head_before
+    assert run_path.read_bytes() == state_before
+    assert not (project / ".hoh" / "lock").exists()
 
 
 def test_resume_rejects_tampered_completed_candidate_metadata(tmp_path: Path) -> None:
@@ -80,6 +107,10 @@ def test_resume_recovers_candidate_commit_that_landed_before_metadata(
     services.git.land_prepared_commit = land  # type: ignore[method-assign]
     services.backend.requests.clear()
     landed_candidate = services.git.head_sha()
+
+    _, inspected = services.orchestrator.inspect_latest()
+    assert inspected["status"] == "resumable"
+    assert inspected["completed_loops"] == 0
 
     result = services.orchestrator.resume()
 
@@ -356,6 +387,10 @@ def test_resume_recovers_evidence_commit_that_landed_before_closure_journal(
     services.git.land_prepared_commit = land  # type: ignore[method-assign]
     services.backend.requests.clear()
     evidence_head = services.git.head_sha()
+
+    _, inspected = services.orchestrator.inspect_latest()
+    assert inspected["status"] == "resumable"
+    assert inspected["completed_loops"] == 0
 
     result = services.orchestrator.resume()
 

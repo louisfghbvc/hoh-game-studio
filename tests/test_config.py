@@ -164,6 +164,35 @@ def test_doctor_blocks_duplicate_requirement_claim_ids(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "requirements",
+    [
+        {
+            "schema_version": 999,
+            "claims": [
+                {"id": "boot", "description": "The product boots.", "required": True}
+            ],
+        },
+        {"schema_version": 1, "claims": [{"description": "Boots", "required": True}]},
+        {"schema_version": 1, "claims": [{"id": "boot", "required": True}]},
+    ],
+)
+def test_doctor_blocks_requirements_that_fail_packaged_draft_2020_12_schema(
+    tmp_path: Path, requirements: dict[str, object]
+) -> None:
+    git_init(tmp_path)
+    initialize_project(tmp_path, "command", "test-model", "high")
+    (tmp_path / ".hoh" / "requirements.json").write_text(
+        json.dumps(requirements), encoding="utf-8"
+    )
+
+    diagnostics = doctor(load_config(tmp_path))
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].code == "requirements:schema"
+    assert diagnostics[0].severity == "blocked"
+
+
 def test_domain_records_are_immutable() -> None:
     diagnostic = Diagnostic("config", "info", "ready")
 

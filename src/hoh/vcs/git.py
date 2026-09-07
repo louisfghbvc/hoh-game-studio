@@ -92,6 +92,64 @@ class GitService:
         )
         return tuple(sorted(set(tracked) | set(untracked)))
 
+    def changed_paths_between(self, base_sha: str, commit_sha: str) -> tuple[str, ...]:
+        """Return the literal path set changed between two durable commits."""
+
+        changed = self._split_nul(
+            self._run(
+                (
+                    "diff",
+                    "--name-only",
+                    "--relative",
+                    "--no-renames",
+                    "-z",
+                    base_sha,
+                    commit_sha,
+                    "--",
+                )
+            )
+        )
+        return tuple(sorted(changed))
+
+    def file_sha256_at(self, commit_sha: str, relative_path: str) -> str:
+        """Hash one repository-relative file exactly as stored in a commit."""
+
+        path = PurePosixPath(relative_path)
+        if (
+            not relative_path
+            or "\\" in relative_path
+            or ":" in relative_path
+            or path.is_absolute()
+            or relative_path != path.as_posix()
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise GitError("commit file path is not normalized")
+        content = self._run_bytes(("show", f"{commit_sha}:{relative_path}"))
+        return hashlib.sha256(content).hexdigest()
+
+    def worktree_file_sha256_at(self, commit_sha: str, relative_path: str) -> str:
+        """Hash a committed file after applying its working-tree filters."""
+
+        path = PurePosixPath(relative_path)
+        if (
+            not relative_path
+            or "\\" in relative_path
+            or ":" in relative_path
+            or path.is_absolute()
+            or relative_path != path.as_posix()
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise GitError("commit file path is not normalized")
+        content = self._run_bytes(
+            (
+                "cat-file",
+                "--filters",
+                f"--path={relative_path}",
+                f"{commit_sha}:{relative_path}",
+            )
+        )
+        return hashlib.sha256(content).hexdigest()
+
     def candidate_mutation_manifest(
         self, base_sha: str, paths: tuple[str, ...]
     ) -> dict[str, object]:

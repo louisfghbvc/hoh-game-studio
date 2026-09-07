@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 
@@ -224,6 +224,37 @@ class IssueLedger:
         issues = document["issues"]
         assert isinstance(issues, list)
         return _derived_summary(issues)
+
+    def validate_replay(
+        self, evidence_by_loop: Sequence[tuple[int, Mapping[str, object]]]
+    ) -> dict[str, object]:
+        """Read-only check that ledger applications match normalized evidence."""
+
+        expected: list[dict[str, object]] = []
+        for loop_index, evidence in evidence_by_loop:
+            if (
+                isinstance(loop_index, bool)
+                or not isinstance(loop_index, int)
+                or loop_index < 1
+            ):
+                raise IssueLedgerError("loop_index must be a positive integer")
+            candidate = evidence.get("candidate_sha")
+            if not isinstance(candidate, str) or not candidate:
+                raise IssueLedgerError("evidence candidate_sha must be non-empty")
+            expected.append(
+                {
+                    "loop": loop_index,
+                    "candidate": candidate,
+                    "evidence_sha256": _canonical_evidence_sha256(evidence),
+                }
+            )
+        document = self.load()
+        applications = document.get("applications")
+        if applications != expected:
+            raise IssueLedgerError(
+                "issue ledger applications do not match durable evidence replay"
+            )
+        return document
 
 
 def _evidence_records(

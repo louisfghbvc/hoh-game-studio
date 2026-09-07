@@ -6,9 +6,13 @@ import re
 import subprocess
 import sys
 from collections.abc import Mapping
+from importlib import resources
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 
 try:
     import tomllib
@@ -333,8 +337,29 @@ def doctor(config: HarnessConfig) -> tuple[Diagnostic, ...]:
     requirements_path = config.project / ".hoh" / "requirements.json"
     try:
         requirements: Any = json.loads(requirements_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        requirements = None
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return (
+            Diagnostic(
+                "requirements:schema",
+                "blocked",
+                f"requirements.json could not be read as JSON: {type(error).__name__}",
+            ),
+        )
+    validator = _requirements_validator()
+    schema_errors = sorted(
+        validator.iter_errors(requirements),
+        key=lambda error: tuple(str(item) for item in error.absolute_path),
+    )
+    if schema_errors:
+        error = schema_errors[0]
+        location = ".".join(str(item) for item in error.absolute_path) or "document"
+        return (
+            Diagnostic(
+                "requirements:schema",
+                "blocked",
+                f"requirements.json failed schema at {location}: {error.message}",
+            ),
+        )
     claims = requirements.get("claims") if isinstance(requirements, dict) else None
     duplicate_claim_ids = _duplicate_claim_ids(claims)
     if duplicate_claim_ids:
@@ -358,6 +383,18 @@ def doctor(config: HarnessConfig) -> tuple[Diagnostic, ...]:
             ),
         )
     return ()
+
+
+def _requirements_validator() -> Draft202012Validator:
+    schema_resource = resources.files("hoh").joinpath(
+        "resources", "schemas", "requirements.schema.json"
+    )
+    try:
+        schema = json.loads(schema_resource.read_text(encoding="utf-8"))
+        Draft202012Validator.check_schema(schema)
+    except (OSError, UnicodeError, json.JSONDecodeError, SchemaError) as error:
+        raise ConfigError("packaged requirements schema is unavailable or invalid") from error
+    return Draft202012Validator(schema)
 
 
 def _duplicate_claim_ids(claims: object) -> tuple[str, ...]:

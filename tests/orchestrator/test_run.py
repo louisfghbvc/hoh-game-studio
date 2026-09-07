@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,7 +13,7 @@ from hoh.backends import (
     FakeResponse,
 )
 from hoh.models import Role, Sandbox
-from hoh.orchestrator import PreflightError, RoleOutputError
+from hoh.orchestrator import PreflightError, ResumeError, RoleOutputError
 from hoh.policy import StopPolicy
 from hoh.state.evidence import EvidenceBindingError
 from hoh.state.store import StateConflictError
@@ -25,6 +26,7 @@ from tests.orchestrator.helpers import (
     build_services,
     config_for,
     count_candidate_commits,
+    crashed_after_candidate_fixture,
     developer_change,
     developer_response,
     initialized_product,
@@ -94,6 +96,143 @@ def test_one_loop_calls_roles_in_order_and_freezes_qa(tmp_path: Path) -> None:
     assert requests[2].workspace != project
     assert result["loops_completed"] == 1
     assert (project / ".hoh" / "runs" / result["run_id"]).exists()
+
+
+def test_authoritative_inspection_reconstructs_valid_closed_and_resumable_runs(
+    tmp_path: Path,
+) -> None:
+    project, services = orchestrator_fixture(tmp_path)
+    result = services.orchestrator.run(max_loops=1)
+
+    run_dir, status = services.orchestrator.inspect_latest()
+
+    assert run_dir.name == result["run_id"]
+    assert status["terminal_status"] == "budget_exhausted"
+    assert status["current_candidate"] == result["current_candidate"]
+    assert status["completed_loops"] == 1
+
+    resumable_root = tmp_path / "resumable"
+    resumable_root.mkdir()
+    resumable_project, resumable_services = crashed_after_candidate_fixture(resumable_root)
+    resumable_dir, resumable = resumable_services.orchestrator.inspect_latest()
+    assert resumable_dir.parent == resumable_project / ".hoh" / "runs"
+    assert resumable["terminal_status"] == "resumable"
+    assert resumable["current_candidate"] == resumable_services.git.head_sha()
+    assert resumable["completed_loops"] == 0
+
+
+def test_authoritative_inspection_rejects_forged_aggregate_candidate_and_loops(
+    tmp_path: Path,
+) -> None:
+    project, services = orchestrator_fixture(tmp_path)
+    result = services.orchestrator.run(max_loops=1)
+    run_path = project / ".hoh" / "runs" / str(result["run_id"]) / "run.json"
+    state = json.loads(run_path.read_text(encoding="utf-8"))
+    forged = "f" * 40
+    state.update(
+        {
+            "status": "complete",
+            "reason": "forged complete",
+            "current_candidate": forged,
+            "best_candidate": forged,
+            "loops": [
+                {
+                    "loop_index": 1,
+                    "candidate_sha": forged,
+                    "normalized_evidence": {
+                        "candidate_sha": forged,
+                        "product_complete": True,
+                    },
+                }
+            ],
+        }
+    )
+    run_path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+
+    with pytest.raises(StateConflictError, match="aggregate|candidate|loop|status"):
+        services.orchestrator.inspect_latest()
+
+
+def test_authoritative_inspection_replays_hash_bound_evidence_intents_and_ledger(
+    tmp_path: Path,
+) -> None:
+    project, services = orchestrator_fixture(tmp_path)
+    result = services.orchestrator.run(max_loops=1)
+    loop_dir = (
+        project
+        / ".hoh"
+        / "runs"
+        / str(result["run_id"])
+        / "loops"
+        / "loop-0001"
+    )
+
+    candidate_path = loop_dir / "candidate.json"
+    candidate_bytes = candidate_path.read_bytes()
+    candidate_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(StateConflictError, match="artifact|candidate"):
+        services.orchestrator.inspect_latest()
+    candidate_path.write_bytes(candidate_bytes)
+
+    proof_path = loop_dir / "adapter" / "artifacts" / "proof.txt"
+    proof_bytes = proof_path.read_bytes()
+    proof_path.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(
+        (EvidenceBindingError, StateConflictError), match="artifact|evidence|hash"
+    ):
+        services.orchestrator.inspect_latest()
+    proof_path.write_bytes(proof_bytes)
+
+    ledger_path = project / ".hoh" / "issue-ledger.json"
+    ledger_bytes = ledger_path.read_bytes()
+    ledger = json.loads(ledger_bytes)
+    ledger["applications"][0]["evidence_sha256"] = "0" * 64
+    ledger_path.write_text(json.dumps(ledger) + "\n", encoding="utf-8")
+    with pytest.raises((StateConflictError, ValueError), match="ledger|evidence"):
+        services.orchestrator.inspect_latest()
+    ledger_path.write_bytes(ledger_bytes)
+
+    intent_path = loop_dir / "evidence-commit-intent.json"
+    intent_bytes = intent_path.read_bytes()
+    intent = json.loads(intent_bytes)
+    intent["prepared_sha"] = "f" * 40
+    intent_path.write_text(json.dumps(intent) + "\n", encoding="utf-8")
+    with pytest.raises(StateConflictError, match="commit|intent|Git"):
+        services.orchestrator.inspect_latest()
+    intent_path.write_bytes(intent_bytes)
+
+    assert services.orchestrator.inspect_latest()[1]["completed_loops"] == 1
+
+
+@pytest.mark.parametrize("cancellation", [KeyboardInterrupt(), asyncio.CancelledError()])
+def test_user_cancellation_is_durably_terminal_and_never_resumable(
+    tmp_path: Path, cancellation: BaseException
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = ScriptedBackend([cancellation])
+    services = build_services(project, backend, RecordingAdapter())
+
+    result = services.orchestrator.run(max_loops=1)
+
+    assert result["status"] == "cancelled"
+    assert result["terminal_status"] == "cancelled"
+    assert result["reason"] == "run cancelled by user"
+    run_dir = project / ".hoh" / "runs" / str(result["run_id"])
+    state = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert state["status"] == "cancelled"
+    assert state["reason"] == "run cancelled by user"
+    assert "resumable" not in json.dumps(state)
+    assert "Status: cancelled" in (run_dir / "run-summary.md").read_text(
+        encoding="utf-8"
+    )
+    receipt = next((run_dir / "loops" / "loop-0001" / "receipts").glob("*.json"))
+    assert json.loads(receipt.read_text(encoding="utf-8"))["outcome"] == "error"
+    assert not (project / ".hoh" / "lock").exists()
+    _, inspected = services.orchestrator.inspect_latest()
+    assert inspected["status"] == "cancelled"
+    assert inspected["reason"] == "run cancelled by user"
+    with pytest.raises(ResumeError, match="no resumable"):
+        services.orchestrator.resume()
 
 
 def test_schema_invalid_role_output_gets_one_fresh_repair_attempt(tmp_path: Path) -> None:
@@ -425,6 +564,9 @@ def test_two_loop_bound_runs_fresh_roles_and_stops_after_second_closure(
     ]
     assert count_candidate_commits(project) == 2
     assert services.adapter.check_calls == 2
+    _, inspected = services.orchestrator.inspect_latest()
+    assert inspected["completed_loops"] == 2
+    assert inspected["status"] == "budget_exhausted"
 
 
 def test_completion_requires_distinct_full_release_qa_and_fresh_check(
@@ -454,6 +596,9 @@ def test_completion_requires_distinct_full_release_qa_and_fresh_check(
     assert "FULL RELEASE" in backend.requests[3].prompt
     assert backend.requests[3].sandbox is Sandbox.READ_ONLY
     assert services.adapter.check_calls == 2
+    _, inspected = services.orchestrator.inspect_latest()
+    assert inspected["status"] == "complete"
+    assert inspected["guidance"] == f"git merge {result['current_candidate']}"
     loop_record_path = (
         project
         / ".hoh"

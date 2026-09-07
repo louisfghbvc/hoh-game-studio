@@ -313,3 +313,41 @@ def test_completed_offline_cli_recommends_candidate_not_evidence_commit(
     assert status["current_candidate"] == candidate_commit
     assert status["best_candidate"] == candidate_commit
     assert status["guidance"] == f"git merge {candidate_commit}"
+
+    run_dir = next((project / ".hoh" / "runs").iterdir())
+    summary_path = run_dir / "run-summary.md"
+    summary_before = summary_path.read_bytes()
+    run_path = run_dir / "run.json"
+    run_state = json.loads(run_path.read_text(encoding="utf-8"))
+    forged = "f" * 40
+    run_state.update(
+        {
+            "status": "complete",
+            "reason": "forged complete",
+            "current_candidate": forged,
+            "best_candidate": forged,
+            "loops": [
+                {
+                    "loop_index": 1,
+                    "candidate_sha": forged,
+                    "normalized_evidence": {
+                        "candidate_sha": forged,
+                        "product_complete": True,
+                    },
+                }
+            ],
+        }
+    )
+    run_path.write_text(json.dumps(run_state) + "\n", encoding="utf-8")
+
+    assert cli.main(["status", "--project", str(project), "--json"]) == 5
+    rejected_status = capsys.readouterr()
+    assert rejected_status.out == ""
+    assert "durable" in rejected_status.err
+    assert f"git merge {forged}" not in rejected_status.err
+
+    assert cli.main(["report", "--project", str(project)]) == 5
+    rejected_report = capsys.readouterr()
+    assert rejected_report.out == ""
+    assert "durable" in rejected_report.err
+    assert summary_path.read_bytes() == summary_before

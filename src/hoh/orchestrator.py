@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -86,6 +87,9 @@ _ROLE_SCHEMA = {
     Role.DEVELOPER: "developer-report.schema.json",
     Role.QA: "evidence.schema.json",
 }
+_DURABLE_RUN_STATUSES = frozenset(
+    {"running", "resumable", "complete", "blocked", "budget_exhausted", "cancelled"}
+)
 
 
 class HoHOrchestrator:
@@ -168,24 +172,395 @@ class HoHOrchestrator:
         self._write_run_state(run_dir, run_state)
         return self._drive(run_dir, run_state)
 
-    def resume(self) -> dict[str, object]:
-        """Continue the newest durable resumable run from its first incomplete phase."""
+    def resume(self, expected_run_id: str | None = None) -> dict[str, object]:
+        """Continue the newest resumable run, optionally checking its identity.
 
-        run_dir, run_state = self._latest_resumable_run()
-        branch = run_state.get("branch")
+        Selection and the optional identity check happen while holding the same
+        product lock as execution, so callers cannot race a preflight lookup
+        against the run that is actually resumed.
+        """
+
+        lock = RunLock(self.config.project / ".hoh" / "lock")
+        lock.acquire()
+        try:
+            run_dir, run_state = self._latest_resumable_run()
+            selected_run_id = _required_text(run_state, "run_id")
+            if expected_run_id is not None and expected_run_id != selected_run_id:
+                raise ResumeError(
+                    "--run-id must match the newest resumable run; "
+                    f"newest resumable run is {selected_run_id}"
+                )
+            branch = run_state.get("branch")
+            if (
+                not isinstance(branch, str)
+                or self.git.current_branch_in(self.config.project) != branch
+            ):
+                raise ResumeError("the resumable run branch is not checked out")
+            return self._drive_locked(run_dir, run_state)
+        finally:
+            lock.release()
+
+    def inspect_latest(self) -> tuple[Path, dict[str, object]]:
+        """Reconstruct the newest run status from validated durable artifacts.
+
+        ``run.json`` is an aggregate/cache.  Inspection validates it against
+        phase journals, hash-bound artifacts, receipts, the issue ledger, and
+        Git commit identities before returning any user-facing status.
+        """
+
+        run_dir, run_state = self._latest_durable_run()
+        return run_dir, self._inspect_run(run_dir, run_state)
+
+    def _inspect_run(
+        self, run_dir: Path, run_state: Mapping[str, object]
+    ) -> dict[str, object]:
+        run_id = _required_text(run_state, "run_id")
+        if run_dir.name != run_id:
+            raise StateConflictError("durable run metadata does not match its directory")
+        start_sha = _required_text(run_state, "start_sha")
+        try:
+            if self.git.rev_parse_in(
+                self.config.project, f"{start_sha}^{{commit}}"
+            ) != start_sha:
+                raise StateConflictError("durable run start commit is not canonical")
+        except GitError as error:
+            raise StateConflictError("durable run start commit cannot be resolved") from error
+        expected_branch = f"hoh/run-{run_id}"
+        if run_state.get("branch") != expected_branch:
+            raise StateConflictError("durable run branch identity is malformed")
+
+        loop_directories = self._durable_loop_directories(run_dir)
+        previous: list[dict[str, object]] = []
+        receipts: list[dict[str, object]] = []
+        evidence_by_loop: list[tuple[int, Mapping[str, object]]] = []
+        candidates: list[str] = []
+        current_commit = start_sha
+        last_decision: StopDecision | None = None
+        last_evidence_hashes: Mapping[str, str] | None = None
+        latest_qa_loop = 0
+        allowed_heads: set[str] = {start_sha}
+
+        for position, (loop_index, loop_dir) in enumerate(loop_directories):
+            inspected = self._inspect_loop(
+                run_id,
+                loop_index,
+                loop_dir,
+                previous,
+                expected_base_sha=current_commit,
+            )
+            receipts.extend(_mapping_records(inspected.get("receipts")))
+            candidate = _optional_mapping(inspected.get("candidate"))
+            if candidate:
+                candidates.append(_required_text(candidate, "candidate_sha"))
+            evidence = _optional_mapping(inspected.get("evidence"))
+            if evidence:
+                latest_qa_loop = loop_index
+                evidence_by_loop.append((loop_index, evidence))
+            loop_record = _optional_mapping(inspected.get("loop_record"))
+            decision = inspected.get("decision")
+            if loop_record:
+                if not isinstance(decision, StopDecision):
+                    raise StateConflictError("durable closure decision is missing")
+                previous.append(dict(loop_record))
+                current_commit = _required_text(loop_record, "evidence_commit_sha")
+                last_decision = decision
+                hashes = inspected.get("evidence_hashes")
+                if not isinstance(hashes, Mapping):
+                    raise StateConflictError("durable evidence intent hashes are missing")
+                last_evidence_hashes = {
+                    str(path): str(digest) for path, digest in hashes.items()
+                }
+                allowed_heads = {current_commit}
+                if decision.should_stop and position != len(loop_directories) - 1:
+                    raise StateConflictError("durable terminal closure has later loop state")
+            else:
+                if position != len(loop_directories) - 1:
+                    raise StateConflictError("durable loop sequence has an incomplete gap")
+                raw_heads = inspected.get("allowed_heads")
+                if not isinstance(raw_heads, set) or not all(
+                    isinstance(item, str) for item in raw_heads
+                ):
+                    raise StateConflictError("durable active loop Git identity is missing")
+                allowed_heads = set(raw_heads)
+
+        ledger = self.issue_ledger.validate_replay(evidence_by_loop)
         if (
-            not isinstance(branch, str)
-            or self.git.current_branch_in(self.config.project) != branch
+            last_evidence_hashes is not None
+            and latest_qa_loop == len(previous)
         ):
-            raise ResumeError("the resumable run branch is not checked out")
-        return self._drive(run_dir, run_state)
+            ledger_relative = ".hoh/issue-ledger.json"
+            expected_ledger_hash = last_evidence_hashes.get(ledger_relative)
+            if (
+                not isinstance(expected_ledger_hash, str)
+                or _file_sha256(self.config.project / ledger_relative)
+                != expected_ledger_hash
+            ):
+                raise StateConflictError(
+                    "durable issue ledger does not match the latest evidence commit"
+                )
+        if (
+            last_evidence_hashes is not None
+            and last_decision is not None
+            and last_decision.terminal_status == "complete"
+        ):
+            best_relative = ".hoh/best-candidate.json"
+            expected_best_hash = last_evidence_hashes.get(best_relative)
+            if (
+                not isinstance(expected_best_hash, str)
+                or _file_sha256(self.config.project / best_relative)
+                != expected_best_hash
+            ):
+                raise StateConflictError(
+                    "durable best candidate record does not match the completion commit"
+                )
+
+        try:
+            head = self.git.head_sha()
+        except GitError as error:
+            raise StateConflictError("durable run Git HEAD cannot be resolved") from error
+        if head not in allowed_heads:
+            raise StateConflictError("Git HEAD does not match the durable run phase state")
+
+        current_candidate = candidates[-1] if candidates else None
+        terminal_decision = (
+            last_decision
+            if last_decision is not None and last_decision.should_stop
+            else None
+        )
+        decision = self._inspection_decision(run_state, terminal_decision, run_id)
+        best_candidate = (
+            current_candidate if decision.terminal_status == "complete" else None
+        )
+        self._validate_run_aggregate(
+            run_state,
+            previous,
+            receipts,
+            candidates,
+            best_candidate,
+            decision,
+        )
+        reconstructed: dict[str, object] = {
+            "run_id": run_id,
+            "start_sha": start_sha,
+            "loops": previous,
+            "receipts": receipts,
+            "skill_receipts": _unique_skill_receipts(receipts),
+            "current_candidate": current_candidate,
+            "best_candidate": best_candidate,
+            "elapsed_seconds": _nonnegative_int(run_state.get("elapsed_seconds")),
+        }
+        status = build_status(
+            reconstructed,
+            receipts=receipts,
+            decision=decision,
+            issue_ledger=ledger,
+        )
+        result = dict(status)
+        result["status"] = status["terminal_status"]
+        result["loops_completed"] = status["completed_loops"]
+        return result
+
+    def _inspect_loop(
+        self,
+        run_id: str,
+        loop_index: int,
+        loop_dir: Path,
+        previous: list[dict[str, object]],
+        *,
+        expected_base_sha: str,
+    ) -> dict[str, object]:
+        payloads: dict[Phase, dict[str, object]] = {}
+        found_gap = False
+        for phase in Phase:
+            payload = self._phase_payload(run_id, loop_index, phase)
+            if payload is None:
+                found_gap = True
+                continue
+            if found_gap:
+                raise StateConflictError("durable phase journal is not a contiguous prefix")
+            payloads[phase] = payload
+
+        preflight = payloads.get(Phase.PREFLIGHT)
+        if preflight is not None:
+            diagnostics = preflight.get("diagnostics")
+            if preflight.get("adapter") != self.config.adapter or not isinstance(
+                diagnostics, list
+            ) or any(not isinstance(item, Mapping) for item in diagnostics):
+                raise StateConflictError("durable preflight phase is malformed")
+
+        plan = (
+            self._read_descriptor(payloads[Phase.PLANNING], "plan")
+            if Phase.PLANNING in payloads
+            else None
+        )
+        baseline = (
+            self._read_descriptor(payloads[Phase.BASELINE], "checks")
+            if Phase.BASELINE in payloads
+            else None
+        )
+        development: dict[str, object] | None = None
+        if Phase.DEVELOPMENT in payloads:
+            payload = payloads[Phase.DEVELOPMENT]
+            changed_paths = list(_string_sequence(payload.get("changed_paths")))
+            base_sha = _required_text(payload, "base_sha")
+            if base_sha != expected_base_sha:
+                raise StateConflictError("durable development has a wrong Git base")
+            mutation_manifest = self._read_descriptor(payload, "mutation_manifest")
+            self._validate_product_mutation_manifest(
+                mutation_manifest,
+                expected_base_sha=base_sha,
+                expected_paths=changed_paths,
+            )
+            development = {
+                "report": self._read_descriptor(payload, "report"),
+                "base_sha": base_sha,
+                "changed_paths": changed_paths,
+                "mutation_manifest": mutation_manifest,
+            }
+
+        candidate: dict[str, object] | None = None
+        if Phase.CANDIDATE in payloads:
+            if development is None:
+                raise StateConflictError("durable candidate has no development phase")
+            candidate = self._read_descriptor(payloads[Phase.CANDIDATE], "candidate")
+            self._validate_candidate(candidate)
+            candidate_sha = _required_text(candidate, "candidate_sha")
+            if not self._is_direct_child(candidate_sha, expected_base_sha):
+                raise StateConflictError("durable candidate has a wrong Git parent")
+            self._validate_candidate_intent(loop_index, loop_dir, development, candidate)
+
+        pending_candidate: PreparedCommit | None = None
+        if (
+            development is not None
+            and candidate is None
+            and (loop_dir / "candidate-commit-intent.json").is_file()
+        ):
+            pending_candidate = self._validate_candidate_intent(
+                loop_index, loop_dir, development, None
+            )
+
+        checks: dict[str, object] | None = None
+        manifest: dict[str, object] | None = None
+        if Phase.CHECKING in payloads:
+            if candidate is None:
+                raise StateConflictError("durable checks have no candidate phase")
+            payload = payloads[Phase.CHECKING]
+            checks = self._read_descriptor(payload, "checks")
+            manifest = self._read_descriptor(payload, "manifest")
+            self._require_candidate_binding(checks, candidate)
+            self._require_candidate_binding(manifest, candidate)
+            if manifest.get("deterministic_check_id") != _required_text(
+                checks, "check_id"
+            ):
+                raise StateConflictError(
+                    "durable checks and adapter manifest have different identities"
+                )
+            self._validated_manifest_artifact_paths(loop_dir, manifest)
+
+        qa: dict[str, object] | None = None
+        evidence: dict[str, object] | None = None
+        if Phase.QA in payloads:
+            if candidate is None or manifest is None:
+                raise StateConflictError("durable QA has no candidate checks")
+            payload = payloads[Phase.QA]
+            evidence = self._read_descriptor(payload, "evidence")
+            self._require_candidate_binding(evidence, candidate)
+            self._revalidate_normalized_evidence(
+                loop_dir, evidence, candidate, manifest
+            )
+            release_gate = _optional_mapping(payload.get("release_gate"))
+            self._validate_release_gate(loop_dir, release_gate, candidate)
+            qa = {
+                "evidence": evidence,
+                "qa_invocation_id": _required_text(payload, "qa_invocation_id"),
+                "release_gate": release_gate,
+            }
+
+        receipts = self._attempt_receipts(run_id, loop_index, loop_dir)
+        loop_record: dict[str, object] | None = None
+        decision: StopDecision | None = None
+        evidence_hashes: Mapping[str, str] | None = None
+        pending_evidence_sha: str | None = None
+        if Phase.CLOSURE in payloads:
+            if development is None or candidate is None or checks is None or qa is None:
+                raise StateConflictError("durable closure is missing preceding phases")
+            payload = payloads[Phase.CLOSURE]
+            loop_record = self._read_descriptor(payload, "loop_record")
+            receipt = self._read_descriptor(payload, "receipt")
+            expected_receipt = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "loop_index": loop_index,
+                "candidate_sha": _required_text(candidate, "candidate_sha"),
+                "attempts": receipts,
+            }
+            if receipt != expected_receipt:
+                raise StateConflictError("durable closure receipt conflicts with attempts")
+            self._validate_completed_closure(
+                payload,
+                loop_record,
+                previous,
+                development,
+                candidate,
+                checks,
+                qa,
+                require_head=False,
+            )
+            decision = self._closure_decision(payload)
+            evidence_hashes = self._validate_evidence_intent(
+                run_id,
+                loop_index,
+                loop_dir,
+                candidate,
+                manifest,
+                qa,
+                payload,
+                include_best=decision.terminal_status == "complete",
+            )
+        elif (
+            qa is not None
+            and candidate is not None
+            and manifest is not None
+            and (loop_dir / "evidence-commit-intent.json").is_file()
+        ):
+            pending_evidence_sha = self._validate_pending_evidence_intent(
+                run_id, loop_index, loop_dir, candidate, manifest, qa
+            )
+
+        allowed_heads = {expected_base_sha}
+        if pending_candidate is not None:
+            allowed_heads.add(pending_candidate.commit_sha)
+        if candidate is not None:
+            allowed_heads = {_required_text(candidate, "candidate_sha")}
+            if pending_evidence_sha is not None:
+                allowed_heads.add(pending_evidence_sha)
+        if loop_record is not None:
+            allowed_heads = {_required_text(loop_record, "evidence_commit_sha")}
+        return {
+            "candidate": candidate or {},
+            "evidence": evidence or {},
+            "loop_record": loop_record or {},
+            "decision": decision,
+            "receipts": receipts,
+            "evidence_hashes": evidence_hashes,
+            "allowed_heads": allowed_heads,
+        }
 
     def _drive(
         self, run_dir: Path, run_state: dict[str, object]
     ) -> dict[str, object]:
         lock = RunLock(self.config.project / ".hoh" / "lock")
-        run_id = _required_text(run_state, "run_id")
         lock.acquire()
+        try:
+            return self._drive_locked(run_dir, run_state)
+        finally:
+            lock.release()
+
+    def _drive_locked(
+        self, run_dir: Path, run_state: dict[str, object]
+    ) -> dict[str, object]:
+        """Drive one run while its caller owns the product lock."""
+
         started = self._monotonic()
         persisted = run_state.get("elapsed_seconds", 0)
         persisted_seconds = (
@@ -219,11 +594,15 @@ class HoHOrchestrator:
                 run_state["active_loop"] = loop_index + 1
                 run_state["updated_at"] = self._now().isoformat()
                 self._write_run_state(run_dir, run_state)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            return self._persist_cancellation(
+                run_dir,
+                run_state,
+                self._elapsed_seconds(run_state, started, elapsed_base),
+            )
         except BaseException as error:
             self._persist_failure(run_dir, run_state, error)
             raise
-        finally:
-            lock.release()
 
     def _execute_loop(
         self,
@@ -1094,6 +1473,8 @@ class HoHOrchestrator:
         candidate: Mapping[str, object],
         checks: Mapping[str, object],
         qa: Mapping[str, object],
+        *,
+        require_head: bool = True,
     ) -> None:
         """Reconcile a journaled closure with Git and all preceding phase records."""
 
@@ -1114,7 +1495,7 @@ class HoHOrchestrator:
         if (
             resolved != evidence_commit
             or not self._is_direct_child(evidence_commit, candidate_sha)
-            or self.git.head_sha() != evidence_commit
+            or (require_head and self.git.head_sha() != evidence_commit)
         ):
             raise StateConflictError(
                 "Git HEAD does not match the durable closure evidence commit"
@@ -1143,6 +1524,238 @@ class HoHOrchestrator:
                 raise StateConflictError(
                     "durable closure completion no longer satisfies stop policy"
                 )
+
+    def _closure_decision(self, payload: Mapping[str, object]) -> StopDecision:
+        decision = _required_mapping(payload, "decision")
+        should_stop = decision.get("should_stop")
+        if not isinstance(should_stop, bool):
+            raise StateConflictError("durable closure decision is malformed")
+        terminal_status = _optional_text(decision.get("terminal_status"))
+        if should_stop is not (terminal_status is not None):
+            raise StateConflictError("durable closure decision is inconsistent")
+        if terminal_status not in {None, "complete", "blocked", "budget_exhausted"}:
+            raise StateConflictError("durable closure terminal status is invalid")
+        return StopDecision(
+            should_stop,
+            terminal_status,
+            _required_text(decision, "reason"),
+        )
+
+    def _validate_candidate_intent(
+        self,
+        loop_index: int,
+        loop_dir: Path,
+        development: Mapping[str, object],
+        candidate: Mapping[str, object] | None,
+    ) -> PreparedCommit:
+        base_sha = _required_text(development, "base_sha")
+        changed_paths = list(_string_sequence(development.get("changed_paths")))
+        manifest = _required_mapping(development, "mutation_manifest")
+        entries = self._validate_product_mutation_manifest(
+            manifest,
+            expected_base_sha=base_sha,
+            expected_paths=changed_paths,
+        )
+        entry_hashes = {
+            str(entry["path"]): hashlib.sha256(
+                json.dumps(
+                    entry,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            for entry in entries
+        }
+        prepared = self._load_commit_intent(
+            loop_dir / "candidate-commit-intent.json",
+            expected_kind="candidate",
+            expected_loop_index=loop_index,
+            expected_parent_sha=base_sha,
+            expected_selected_paths=changed_paths,
+            expected_selected_hashes=entry_hashes,
+        )
+        if prepared is None:
+            raise StateConflictError("durable candidate phase has no commit intent")
+        candidate_sha = (
+            _required_text(candidate, "candidate_sha")
+            if candidate is not None
+            else prepared.commit_sha
+        )
+        self._validate_prepared_commit(prepared, candidate_sha)
+        try:
+            changed_in_commit = self.git.changed_paths_between(base_sha, candidate_sha)
+        except GitError as error:
+            raise StateConflictError("durable candidate diff cannot be resolved") from error
+        if changed_in_commit != tuple(changed_paths):
+            raise StateConflictError("durable candidate commit has different product paths")
+        for entry in entries:
+            path = str(entry["path"])
+            if entry.get("type") == "deleted":
+                try:
+                    self.git.file_sha256_at(candidate_sha, path)
+                except GitError:
+                    continue
+                raise StateConflictError("durable candidate kept a deleted product path")
+            try:
+                digest = self.git.file_sha256_at(candidate_sha, path)
+            except GitError as error:
+                raise StateConflictError("durable candidate product path is missing") from error
+            if digest != entry.get("sha256"):
+                raise StateConflictError(
+                    "durable candidate product content conflicts with its manifest"
+                )
+        return prepared
+
+    def _validate_pending_evidence_intent(
+        self,
+        run_id: str,
+        loop_index: int,
+        loop_dir: Path,
+        candidate: Mapping[str, object],
+        manifest: Mapping[str, object],
+        qa: Mapping[str, object],
+    ) -> str:
+        intent_path = loop_dir / "evidence-commit-intent.json"
+        try:
+            intent = _read_json(intent_path)
+        except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+            raise StateConflictError("durable evidence commit intent is malformed") from error
+        prepared_sha = _required_text(intent, "prepared_sha")
+        raw_paths = intent.get("selected_paths")
+        if not isinstance(raw_paths, list) or any(
+            not isinstance(path, str) for path in raw_paths
+        ):
+            raise StateConflictError("durable evidence intent path set is malformed")
+        include_best = ".hoh/best-candidate.json" in raw_paths
+        self._validate_evidence_intent(
+            run_id,
+            loop_index,
+            loop_dir,
+            candidate,
+            manifest,
+            qa,
+            {"evidence_commit_sha": prepared_sha},
+            include_best=include_best,
+        )
+        return prepared_sha
+
+    def _validate_evidence_intent(
+        self,
+        run_id: str,
+        loop_index: int,
+        loop_dir: Path,
+        candidate: Mapping[str, object],
+        manifest: Mapping[str, object],
+        qa: Mapping[str, object],
+        closure_payload: Mapping[str, object],
+        *,
+        include_best: bool,
+    ) -> dict[str, str]:
+        intent_path = loop_dir / "evidence-commit-intent.json"
+        try:
+            intent = _read_json(intent_path)
+        except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+            raise StateConflictError("durable evidence commit intent is malformed") from error
+        selected_hashes_raw = intent.get("selected_sha256")
+        if not isinstance(selected_hashes_raw, Mapping) or not all(
+            isinstance(path, str)
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+            for path, digest in selected_hashes_raw.items()
+        ):
+            raise StateConflictError("durable evidence intent hashes are malformed")
+        selected_hashes = {
+            str(path): str(digest)
+            for path, digest in sorted(selected_hashes_raw.items())
+        }
+        selected = self._evidence_commit_paths(
+            run_id,
+            loop_index,
+            loop_dir,
+            manifest,
+            qa,
+            include_best=include_best,
+        )
+        selected_paths = [self._project_relative(path) for path in selected]
+        if set(selected_hashes) != set(selected_paths):
+            raise StateConflictError("durable evidence intent path set is malformed")
+        candidate_sha = _required_text(candidate, "candidate_sha")
+        prepared = self._load_commit_intent(
+            intent_path,
+            expected_kind="evidence",
+            expected_loop_index=loop_index,
+            expected_parent_sha=candidate_sha,
+            expected_selected_paths=selected_paths,
+            expected_selected_hashes=selected_hashes,
+        )
+        if prepared is None:  # pragma: no cover - the file was read above
+            raise StateConflictError("durable closure has no evidence commit intent")
+        evidence_commit = _required_text(closure_payload, "evidence_commit_sha")
+        self._validate_prepared_commit(prepared, evidence_commit)
+        try:
+            changed_in_commit = set(
+                self.git.changed_paths_between(candidate_sha, evidence_commit)
+            )
+        except GitError as error:
+            raise StateConflictError("durable evidence commit diff cannot be resolved") from error
+        if not changed_in_commit.issubset(set(selected_paths)):
+            raise StateConflictError("durable evidence commit contains unselected paths")
+        empty_hash = hashlib.sha256(b"").hexdigest()
+        for relative in selected_paths:
+            expected_hash = selected_hashes[relative]
+            try:
+                committed_hash = self.git.worktree_file_sha256_at(
+                    evidence_commit, relative
+                )
+            except GitError as error:
+                current = self.config.project.joinpath(*PurePosixPath(relative).parts)
+                if (
+                    expected_hash == empty_hash
+                    and current.is_file()
+                    and current.stat().st_size == 0
+                ):
+                    continue
+                raise StateConflictError(
+                    "durable evidence commit is missing selected content"
+                ) from error
+            if committed_hash != expected_hash:
+                raise StateConflictError(
+                    "durable evidence commit content conflicts with its intent"
+                )
+
+            if relative.startswith(
+                self._project_relative(loop_dir) + "/"
+            ) and not relative.endswith("/loop-record.json"):
+                current = self.config.project.joinpath(*PurePosixPath(relative).parts)
+                if _file_sha256(current) != expected_hash:
+                    raise StateConflictError(
+                        "durable loop artifact no longer matches its evidence commit"
+                    )
+        return selected_hashes
+
+    def _validate_prepared_commit(
+        self, prepared: PreparedCommit, expected_commit_sha: str
+    ) -> None:
+        try:
+            resolved = self.git.rev_parse_in(
+                self.config.project, f"{prepared.commit_sha}^{{commit}}"
+            )
+            parent = self.git.rev_parse_in(
+                self.config.project, f"{prepared.commit_sha}^"
+            )
+            tree = self.git.rev_parse_in(
+                self.config.project, f"{prepared.commit_sha}^{{tree}}"
+            )
+        except GitError as error:
+            raise StateConflictError("durable prepared commit cannot be resolved") from error
+        if (
+            prepared.commit_sha != expected_commit_sha
+            or resolved != prepared.commit_sha
+            or parent != prepared.parent_sha
+            or tree != prepared.tree_sha
+        ):
+            raise StateConflictError("durable prepared commit identity conflicts with Git")
 
     def _invoke_role(
         self,
@@ -2386,6 +2999,38 @@ class HoHOrchestrator:
             # The external record remains authoritative when protected state was damaged.
             pass
 
+    def _persist_cancellation(
+        self,
+        run_dir: Path,
+        run_state: dict[str, object],
+        elapsed_seconds: int,
+    ) -> dict[str, object]:
+        """Record user cancellation as a terminal, non-resumable outcome."""
+
+        run_id = _required_text(run_state, "run_id")
+        cancellation: dict[str, object] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "status": "cancelled",
+            "reason": "run cancelled by user",
+        }
+        atomic_write_json(self._host_staging_root / run_id / "cancellation.json", cancellation)
+        receipts = self._attempt_receipts_for_run(run_dir)
+        run_state.pop("failure", None)
+        run_state["cancellation"] = cancellation
+        run_state["receipts"] = receipts
+        run_state["skill_receipts"] = _unique_skill_receipts(receipts)
+        run_state["elapsed_seconds"] = elapsed_seconds
+        run_state["status"] = "cancelled"
+        run_state["reason"] = "run cancelled by user"
+        run_state["updated_at"] = self._now().isoformat()
+        self._write_run_state(run_dir, run_state)
+        return self._terminal_result(
+            run_dir,
+            run_state,
+            StopDecision(True, "cancelled", "run cancelled by user"),
+        )
+
     @staticmethod
     def _classify_failure(error: BaseException) -> tuple[str, bool]:
         if isinstance(error, PreflightError):
@@ -2399,6 +3044,199 @@ class HoHOrchestrator:
         if isinstance(error, (GitError, StateError, OSError)):
             return "infrastructure", True
         return "infrastructure", True
+
+    def _latest_durable_run(self) -> tuple[Path, dict[str, object]]:
+        runs_root = self.config.project / ".hoh" / "runs"
+        candidates: list[tuple[str, str, Path, dict[str, object]]] = []
+        if runs_root.is_dir():
+            for metadata_path in sorted(runs_root.glob("*/run.json")):
+                try:
+                    state = _read_json(metadata_path)
+                except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+                    raise StateConflictError(
+                        f"could not read durable run state: {metadata_path}"
+                    ) from error
+                run_id = state.get("run_id")
+                if run_id != metadata_path.parent.name:
+                    raise StateConflictError(
+                        "durable run metadata does not match its directory"
+                    )
+                updated = state.get("updated_at")
+                candidates.append(
+                    (
+                        updated if isinstance(updated, str) else "",
+                        metadata_path.parent.name,
+                        metadata_path.parent,
+                        state,
+                    )
+                )
+        if not candidates:
+            raise ResumeError("no durable HoH run exists")
+        _, _, run_dir, state = max(candidates, key=lambda item: (item[0], item[1]))
+        return run_dir, state
+
+    def _durable_loop_directories(self, run_dir: Path) -> list[tuple[int, Path]]:
+        loops_root = run_dir / "loops"
+        if not loops_root.exists():
+            return []
+        if loops_root.is_symlink() or not loops_root.is_dir():
+            raise StateConflictError("durable loops path is not a regular directory")
+        result: list[tuple[int, Path]] = []
+        pattern = re.compile(r"loop-(\d{4})")
+        for path in sorted(loops_root.iterdir(), key=lambda item: item.name):
+            match = pattern.fullmatch(path.name)
+            if match is None or path.is_symlink() or not path.is_dir():
+                raise StateConflictError("durable loops directory contains an invalid entry")
+            result.append((int(match.group(1)), path))
+        indices = [index for index, _ in result]
+        if indices != list(range(1, len(indices) + 1)):
+            raise StateConflictError("durable loop directory sequence is not contiguous")
+        return result
+
+    def _inspection_decision(
+        self,
+        run_state: Mapping[str, object],
+        terminal_decision: StopDecision | None,
+        run_id: str,
+    ) -> StopDecision:
+        raw_status = run_state.get("status")
+        if not isinstance(raw_status, str) or raw_status not in _DURABLE_RUN_STATUSES:
+            raise StateConflictError("durable run state has an invalid status")
+        if terminal_decision is not None:
+            if raw_status == terminal_decision.terminal_status:
+                if run_state.get("reason") != terminal_decision.reason:
+                    raise StateConflictError(
+                        "durable run reason conflicts with its terminal closure"
+                    )
+            elif raw_status in {"resumable", "blocked"}:
+                self._validated_failure(run_state, run_id)
+            elif raw_status != "running":
+                raise StateConflictError(
+                    "durable run status conflicts with its terminal closure"
+                )
+            return terminal_decision
+        if raw_status == "cancelled":
+            return self._validated_cancellation(run_state, run_id)
+        if raw_status in {"resumable", "blocked"}:
+            return self._validated_failure(run_state, run_id)
+        if raw_status != "running":
+            raise StateConflictError("durable terminal status has no closure record")
+        return StopDecision(
+            False,
+            "running",
+            _optional_text(run_state.get("reason")) or "run is in progress",
+        )
+
+    def _validated_failure(
+        self, run_state: Mapping[str, object], run_id: str
+    ) -> StopDecision:
+        failure = run_state.get("failure")
+        if not isinstance(failure, Mapping):
+            raise StateConflictError("durable failed run has no structured failure")
+        external_path = self._host_staging_root / run_id / "failure.json"
+        try:
+            external = _read_json(external_path)
+        except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+            raise StateConflictError("durable external failure record is unavailable") from error
+        if dict(failure) != external:
+            raise StateConflictError("durable failure records conflict")
+        category = failure.get("category")
+        code = failure.get("code")
+        repairable = failure.get("repairable")
+        if (
+            category not in {"infrastructure", "protocol"}
+            or not isinstance(code, str)
+            or not code
+            or not isinstance(repairable, bool)
+        ):
+            raise StateConflictError("durable failure record is malformed")
+        status = "resumable" if repairable else "blocked"
+        reason = (
+            f"resumable {category} failure: {code}"
+            if repairable
+            else f"unrecoverable {category} failure: {code}"
+        )
+        if run_state.get("status") != status or run_state.get("reason") != reason:
+            raise StateConflictError("durable failure aggregate is inconsistent")
+        return StopDecision(True, status, reason)
+
+    def _validated_cancellation(
+        self, run_state: Mapping[str, object], run_id: str
+    ) -> StopDecision:
+        cancellation = run_state.get("cancellation")
+        if not isinstance(cancellation, Mapping):
+            raise StateConflictError("durable cancelled run has no cancellation record")
+        external_path = self._host_staging_root / run_id / "cancellation.json"
+        try:
+            external = _read_json(external_path)
+        except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+            raise StateConflictError(
+                "durable external cancellation record is unavailable"
+            ) from error
+        expected = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "status": "cancelled",
+            "reason": "run cancelled by user",
+        }
+        if dict(cancellation) != expected or external != expected:
+            raise StateConflictError("durable cancellation records conflict")
+        if (
+            run_state.get("status") != "cancelled"
+            or run_state.get("reason") != "run cancelled by user"
+        ):
+            raise StateConflictError("durable cancellation aggregate is inconsistent")
+        return StopDecision(True, "cancelled", "run cancelled by user")
+
+    def _validate_run_aggregate(
+        self,
+        run_state: Mapping[str, object],
+        loops: Sequence[Mapping[str, object]],
+        receipts: Sequence[Mapping[str, object]],
+        candidates: Sequence[str],
+        best_candidate: str | None,
+        decision: StopDecision,
+    ) -> None:
+        raw_loops = run_state.get("loops")
+        if not isinstance(raw_loops, list) or any(
+            not isinstance(item, Mapping) for item in raw_loops
+        ):
+            raise StateConflictError("durable aggregate loops are malformed")
+        aggregate_loops = [dict(item) for item in raw_loops]
+        if len(aggregate_loops) > len(loops) or aggregate_loops != [
+            dict(item) for item in loops[: len(aggregate_loops)]
+        ]:
+            raise StateConflictError("durable aggregate loops conflict with phase records")
+
+        aggregate_candidate = run_state.get("current_candidate")
+        if aggregate_candidate is not None and aggregate_candidate not in set(candidates):
+            raise StateConflictError(
+                "durable aggregate current candidate is not phase-bound"
+            )
+        aggregate_best = run_state.get("best_candidate")
+        valid_best_candidates = (
+            {best_candidate} if best_candidate is not None else set(candidates)
+        )
+        if aggregate_best is not None and aggregate_best not in valid_best_candidates:
+            raise StateConflictError("durable aggregate best candidate is not closure-bound")
+
+        raw_receipts = run_state.get("receipts")
+        if not isinstance(raw_receipts, list) or any(
+            not isinstance(item, Mapping) for item in raw_receipts
+        ):
+            raise StateConflictError("durable aggregate receipts are malformed")
+        aggregate_receipts = [dict(item) for item in raw_receipts]
+        if len(aggregate_receipts) > len(receipts) or aggregate_receipts != [
+            dict(item) for item in receipts[: len(aggregate_receipts)]
+        ]:
+            raise StateConflictError(
+                "durable aggregate receipts conflict with retained receipts"
+            )
+        elapsed = run_state.get("elapsed_seconds", 0)
+        if isinstance(elapsed, bool) or not isinstance(elapsed, int) or elapsed < 0:
+            raise StateConflictError("durable aggregate elapsed time is malformed")
+        if decision.terminal_status == "complete" and best_candidate is None:
+            raise StateConflictError("durable completion has no candidate")
 
     def _latest_resumable_run(self) -> tuple[Path, dict[str, object]]:
         runs_root = self.config.project / ".hoh" / "runs"
@@ -2569,6 +3407,10 @@ def _required_text(record: Mapping[str, object], field: str) -> str:
 
 def _optional_text(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _nonnegative_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 def _required_positive_int(record: Mapping[str, object], field: str) -> int:

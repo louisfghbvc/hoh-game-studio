@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import shutil
 import sys
@@ -37,10 +38,10 @@ from hoh.orchestrator import (
 )
 from hoh.policy import StopPolicy
 from hoh.prompts import PromptRenderer, PromptRenderingError
-from hoh.reporting import build_status, render_run_summary, write_run_summary
+from hoh.reporting import render_run_summary, write_run_summary
 from hoh.skills.registry import SkillRegistry, SkillValidationError
 from hoh.state.evidence import EvidenceBindingError
-from hoh.state.issue_ledger import IssueLedger, IssueLedgerError
+from hoh.state.issue_ledger import IssueLedgerError
 from hoh.state.store import RunLockedError, StateConflictError, StateError, StateStore
 from hoh.vcs.git import DirtyWorktreeError, GitError, GitService, ProtectedPathError
 
@@ -48,9 +49,6 @@ from hoh.vcs.git import DirtyWorktreeError, GitError, GitService, ProtectedPathE
 _SUCCESS_STATUSES = frozenset({"complete"})
 _INCOMPLETE_STATUSES = frozenset({"blocked", "budget_exhausted"})
 _CANCELLED_STATUSES = frozenset({"cancelled"})
-_RUN_STATUSES = frozenset(
-    {"running", "resumable", *_SUCCESS_STATUSES, *_INCOMPLETE_STATUSES, *_CANCELLED_STATUSES}
-)
 _PROTOCOL_ERRORS = (
     BackendProtocolError,
     EvidenceBindingError,
@@ -226,7 +224,7 @@ def main(
         return 2
     try:
         return int(handler(arguments, backend))
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         print("run cancelled by user", file=sys.stderr)
         return 130
     except (ConfigError, ResumeError, SkillValidationError) as error:
@@ -257,13 +255,7 @@ def _handle_doctor(arguments: argparse.Namespace, backend: AgentBackend | None) 
     services = build_services(
         config, backend_name=backend if backend is not None else "codex-exec"
     )
-    diagnostics = _deduplicated_diagnostics(
-        (
-            *config_doctor(config),
-            *_host_diagnostics(config, services),
-            *services.adapter.doctor(config.project),
-        )
-    )
+    diagnostics = _prerequisite_diagnostics(config, services)
     if not diagnostics:
         print("info: doctor: all prerequisites are available")
         return 0
@@ -278,6 +270,11 @@ def _handle_run(arguments: argparse.Namespace, backend: AgentBackend | None) -> 
     services = build_services(
         config, backend_name=backend if backend is not None else "codex-exec"
     )
+    diagnostics = _prerequisite_diagnostics(config, services)
+    if any(item.severity == "blocked" for item in diagnostics):
+        for diagnostic in diagnostics:
+            print(f"{diagnostic.severity}: {diagnostic.code}: {diagnostic.message}")
+        return 3
     result = _normalized_result(services.orchestrator.run(arguments.max_loops))
     exit_code = _terminal_exit(result)
     _print_human_status(result)
@@ -285,9 +282,8 @@ def _handle_run(arguments: argparse.Namespace, backend: AgentBackend | None) -> 
 
 
 def _handle_status(arguments: argparse.Namespace, backend: AgentBackend | None) -> int:
-    del backend
     config = load_config(Path(arguments.project))
-    _, status = _latest_status(config)
+    _, status = _latest_status(config, backend)
     if arguments.as_json:
         print(json.dumps(status, ensure_ascii=False, sort_keys=True))
     else:
@@ -297,28 +293,21 @@ def _handle_status(arguments: argparse.Namespace, backend: AgentBackend | None) 
 
 def _handle_resume(arguments: argparse.Namespace, backend: AgentBackend | None) -> int:
     config = load_config(Path(arguments.project))
-    if arguments.run_id is not None:
-        newest = _newest_resumable_run_id(config.project)
-        if arguments.run_id != newest:
-            raise ConfigError(
-                f"--run-id must match the newest resumable run; newest resumable run is {newest}"
-            )
     _assert_no_existing_lock(config.project)
     services = build_services(
         config, backend_name=backend if backend is not None else "codex-exec"
     )
-    result = _normalized_result(services.orchestrator.resume())
-    if arguments.run_id is not None and result.get("run_id") != arguments.run_id:
-        raise StateConflictError("resumed run does not match --run-id")
+    result = _normalized_result(
+        services.orchestrator.resume(expected_run_id=arguments.run_id)
+    )
     exit_code = _terminal_exit(result)
     _print_human_status(result)
     return exit_code
 
 
 def _handle_report(arguments: argparse.Namespace, backend: AgentBackend | None) -> int:
-    del backend
     config = load_config(Path(arguments.project))
-    run_dir, status = _latest_status(config)
+    run_dir, status = _latest_status(config, backend)
     summary = render_run_summary(status)
     write_run_summary(run_dir, summary)
     print(summary, end="")
@@ -345,95 +334,14 @@ def _handle_skills_list(
     return 0
 
 
-def _latest_status(config: HarnessConfig) -> tuple[Path, dict[str, object]]:
-    run_dir, run_state = _latest_run(config.project)
-    status_value = run_state.get("status")
-    if not isinstance(status_value, str) or status_value not in _RUN_STATUSES:
-        raise StateConflictError("durable run state has an invalid status")
-    receipts = _mapping_records(run_state.get("receipts"), "run receipts")
-    status = build_status(
-        run_state,
-        receipts=receipts,
-        decision={
-            "terminal_status": status_value,
-            "reason": run_state.get("reason"),
-        },
-        issue_ledger=IssueLedger(config.project / ".hoh" / "issue-ledger.json"),
+def _latest_status(
+    config: HarnessConfig, backend: AgentBackend | None = None
+) -> tuple[Path, dict[str, object]]:
+    services = build_services(
+        config, backend_name=backend if backend is not None else "codex-exec"
     )
+    run_dir, status = services.orchestrator.inspect_latest()
     return run_dir, _normalized_result(status)
-
-
-def _latest_run(project: Path) -> tuple[Path, dict[str, object]]:
-    runs_root = project / ".hoh" / "runs"
-    candidates: list[tuple[str, str, Path, dict[str, object]]] = []
-    if runs_root.is_dir():
-        for metadata_path in sorted(runs_root.glob("*/run.json")):
-            state = _read_run_state(metadata_path)
-            run_id = state.get("run_id")
-            if run_id != metadata_path.parent.name:
-                raise StateConflictError(
-                    "durable run metadata does not match its directory"
-                )
-            updated = state.get("updated_at")
-            candidates.append(
-                (
-                    updated if isinstance(updated, str) else "",
-                    metadata_path.parent.name,
-                    metadata_path.parent,
-                    state,
-                )
-            )
-    if not candidates:
-        raise ConfigError("no durable HoH run exists")
-    _, _, run_dir, state = max(candidates, key=lambda item: (item[0], item[1]))
-    return run_dir, state
-
-
-def _newest_resumable_run_id(project: Path) -> str:
-    runs_root = project / ".hoh" / "runs"
-    candidates: list[tuple[str, str, dict[str, object]]] = []
-    if runs_root.is_dir():
-        for metadata_path in runs_root.glob("*/run.json"):
-            try:
-                state = _read_run_state(metadata_path)
-            except StateConflictError:
-                # Match HoHOrchestrator.resume(): unreadable entries are not durable candidates.
-                continue
-            if state.get("status") not in {"running", "resumable"}:
-                continue
-            updated = state.get("updated_at")
-            candidates.append(
-                (
-                    updated if isinstance(updated, str) else "",
-                    metadata_path.parent.name,
-                    state,
-                )
-            )
-    if not candidates:
-        raise ResumeError("no resumable HoH run exists")
-    _, directory_name, state = max(candidates, key=lambda item: (item[0], item[1]))
-    run_id = state.get("run_id")
-    if run_id != directory_name or not isinstance(run_id, str):
-        raise ResumeError("resumable run metadata does not match its directory")
-    return run_id
-
-
-def _read_run_state(path: Path) -> dict[str, object]:
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise StateConflictError(f"could not read durable run state: {path}") from error
-    if not isinstance(document, dict):
-        raise StateConflictError(f"durable run state is not an object: {path}")
-    return document
-
-
-def _mapping_records(value: object, name: str) -> tuple[Mapping[str, object], ...]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise StateConflictError(f"{name} must be an array of objects")
-    if any(not isinstance(item, Mapping) for item in value):
-        raise StateConflictError(f"{name} must be an array of objects")
-    return tuple(item for item in value if isinstance(item, Mapping))
 
 
 def _normalized_result(result: Mapping[str, object]) -> dict[str, object]:
@@ -555,6 +463,20 @@ def _deduplicated_diagnostics(
     diagnostics: Sequence[Diagnostic],
 ) -> tuple[Diagnostic, ...]:
     return tuple(dict.fromkeys(diagnostics))
+
+
+def _prerequisite_diagnostics(
+    config: HarnessConfig, services: Services
+) -> tuple[Diagnostic, ...]:
+    """Collect the exact prerequisite set shared by ``doctor`` and ``run``."""
+
+    return _deduplicated_diagnostics(
+        (
+            *config_doctor(config),
+            *_host_diagnostics(config, services),
+            *services.adapter.doctor(config.project),
+        )
+    )
 
 
 def _filesystem_resource_directory(resource: object, label: str) -> Path:
