@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -36,6 +37,26 @@ DEFAULTS: dict[str, object] = {
 }
 _REQUIRED_KEYS = frozenset({"adapter", "model", "reasoning_effort", *DEFAULTS})
 _ALLOWED_KEYS = _REQUIRED_KEYS | {"adapter_options"}
+_COMMAND_ADAPTER_KEYS = frozenset(
+    {
+        "checks",
+        "required_artifacts",
+        "artifact_globs",
+        "error_patterns",
+        "entrypoints",
+        "timeout_seconds",
+    }
+)
+_GODOT_ADAPTER_KEYS = frozenset(
+    {
+        "command",
+        "project_subdir",
+        "test_commands",
+        "replay_commands",
+        "required_evidence_globs",
+        "timeout_seconds",
+    }
+)
 
 
 def _require_nonempty_string(value: object, name: str) -> str:
@@ -205,6 +226,105 @@ def load_config(project: Path) -> HarnessConfig:
         protected_paths=_protected_paths(data["protected_paths"]),
         adapter_options=MappingProxyType(dict(adapter_options)),
     )
+
+
+def validated_adapter_options(config: HarnessConfig) -> dict[str, object]:
+    """Return constructor-ready adapter options after strict shape validation.
+
+    ``HarnessConfig`` retains arbitrary TOML tables so loading remains a pure
+    configuration operation.  The concrete adapter boundary validates the
+    selected table immediately before dependency construction.
+    """
+
+    options = dict(config.adapter_options)
+    allowed = (
+        _COMMAND_ADAPTER_KEYS if config.adapter == "command" else _GODOT_ADAPTER_KEYS
+    )
+    unknown = set(options) - allowed
+    if unknown:
+        raise ConfigError(
+            "unknown adapter_options fields for "
+            f"{config.adapter}: {', '.join(sorted(str(item) for item in unknown))}"
+        )
+
+    if config.adapter == "command":
+        result: dict[str, object] = {
+            "checks": _command_vectors(options, "checks"),
+            "required_artifacts": _string_sequence(options, "required_artifacts"),
+            "artifact_globs": _string_sequence(options, "artifact_globs"),
+            "error_patterns": _string_sequence(options, "error_patterns"),
+            "entrypoints": _string_sequence(options, "entrypoints"),
+            "timeout_seconds": _option_positive_integer(options, "timeout_seconds", 60),
+        }
+        for pattern in result["error_patterns"]:  # type: ignore[union-attr]
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ConfigError(
+                    f"adapter_options.error_patterns contains an invalid regular expression: {pattern}"
+                ) from error
+        return result
+
+    command = _string_sequence(options, "command", default=("godot",))
+    if not command:
+        raise ConfigError("adapter_options.command must be a nonempty list of strings")
+    project_subdir = options.get("project_subdir", ".")
+    if not isinstance(project_subdir, str) or not project_subdir:
+        raise ConfigError("adapter_options.project_subdir must be a nonempty string")
+    return {
+        "command": command,
+        "project_subdir": project_subdir,
+        "test_commands": _command_vectors(options, "test_commands"),
+        "replay_commands": _command_vectors(options, "replay_commands"),
+        "required_evidence_globs": _string_sequence(
+            options, "required_evidence_globs"
+        ),
+        "timeout_seconds": _option_positive_integer(options, "timeout_seconds", 60),
+    }
+
+
+def _string_sequence(
+    options: Mapping[str, object],
+    name: str,
+    *,
+    default: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    value = options.get(name, default)
+    if not isinstance(value, (list, tuple)) or isinstance(value, (str, bytes, bytearray)):
+        raise ConfigError(f"adapter_options.{name} must be a list of strings")
+    if any(not isinstance(item, str) or not item for item in value):
+        raise ConfigError(f"adapter_options.{name} must be a list of strings")
+    return tuple(value)
+
+
+def _command_vectors(
+    options: Mapping[str, object], name: str
+) -> tuple[tuple[str, ...], ...]:
+    value = options.get(name, ())
+    if not isinstance(value, (list, tuple)) or isinstance(value, (str, bytes, bytearray)):
+        raise ConfigError(f"adapter_options.{name} must be a list of argument lists")
+    commands: list[tuple[str, ...]] = []
+    for command in value:
+        if (
+            not isinstance(command, (list, tuple))
+            or isinstance(command, (str, bytes, bytearray))
+            or not command
+            or any(not isinstance(argument, str) or not argument for argument in command)
+        ):
+            raise ConfigError(
+                f"adapter_options.{name} must be a list of nonempty argument lists"
+            )
+        commands.append(tuple(command))
+    return tuple(commands)
+
+
+def _option_positive_integer(
+    options: Mapping[str, object], name: str, default: int
+) -> int:
+    value = options.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"adapter_options.{name} must be a positive integer")
+    return value
 
 
 def doctor(config: HarnessConfig) -> tuple[Diagnostic, ...]:
