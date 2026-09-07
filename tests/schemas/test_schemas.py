@@ -109,6 +109,16 @@ def test_requirements_rejects_incomplete_claim_and_unknown_fields(schema_dir: Pa
         )
 
 
+def test_requirements_rejects_identical_duplicate_claim_records(schema_dir: Path) -> None:
+    claim = {"id": "boot", "description": "The product boots.", "required": True}
+
+    with pytest.raises(jsonschema.ValidationError):
+        validate(
+            {"schema_version": 1, "claims": [claim, claim]},
+            schema_dir / "requirements.schema.json",
+        )
+
+
 def test_plan_rejects_more_than_three_priorities(schema_dir: Path) -> None:
     plan = valid_plan()
     plan["priorities"] = [priority(str(index)) for index in range(4)]
@@ -152,6 +162,23 @@ def test_verified_record_requires_candidate_bound_artifact(schema_dir: Path) -> 
 def test_evidence_rejects_execution_records_with_unknown_fields(schema_dir: Path) -> None:
     evidence = valid_evidence()
     evidence["verified_records"][0]["execution_records"][0]["extra"] = "not allowed"  # type: ignore[index]
+
+    with pytest.raises(jsonschema.ValidationError):
+        validate(evidence, schema_dir / "evidence.schema.json")
+
+
+def test_evidence_rejects_unknown_qa_status(schema_dir: Path) -> None:
+    evidence = valid_evidence()
+    evidence["qa_status"] = "unreviewed"
+
+    with pytest.raises(jsonschema.ValidationError):
+        validate(evidence, schema_dir / "evidence.schema.json")
+
+
+def test_completed_evidence_requires_a_verified_record(schema_dir: Path) -> None:
+    evidence = valid_evidence()
+    evidence["product_complete"] = True
+    evidence["verified_records"] = []
 
     with pytest.raises(jsonschema.ValidationError):
         validate(evidence, schema_dir / "evidence.schema.json")

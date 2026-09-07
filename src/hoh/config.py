@@ -216,6 +216,16 @@ def doctor(config: HarnessConfig) -> tuple[Diagnostic, ...]:
     except (OSError, json.JSONDecodeError):
         requirements = None
     claims = requirements.get("claims") if isinstance(requirements, dict) else None
+    duplicate_claim_ids = _duplicate_claim_ids(claims)
+    if duplicate_claim_ids:
+        return (
+            Diagnostic(
+                "requirements:duplicate-claim-id",
+                "blocked",
+                "requirements.json must not contain duplicate claim IDs: "
+                + ", ".join(duplicate_claim_ids),
+            ),
+        )
     has_required_claim = isinstance(claims, list) and any(
         isinstance(claim, dict) and claim.get("required") is True for claim in claims
     )
@@ -228,6 +238,23 @@ def doctor(config: HarnessConfig) -> tuple[Diagnostic, ...]:
             ),
         )
     return ()
+
+
+def _duplicate_claim_ids(claims: object) -> tuple[str, ...]:
+    if not isinstance(claims, list):
+        return ()
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = claim.get("id")
+        if not isinstance(claim_id, str) or not claim_id:
+            continue
+        if claim_id in seen:
+            duplicates.add(claim_id)
+        seen.add(claim_id)
+    return tuple(sorted(duplicates))
 
 
 def handle_init(arguments: argparse.Namespace) -> int:

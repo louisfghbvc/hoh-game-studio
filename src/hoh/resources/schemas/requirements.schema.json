@@ -8,6 +8,7 @@
     "schema_version": {"const": 1},
     "claims": {
       "type": "array",
+      "uniqueItems": true,
       "items": {"$ref": "#/$defs/claim"}
     }
   },

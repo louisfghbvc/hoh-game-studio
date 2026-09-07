@@ -17,7 +17,9 @@
     "iteration": {"type": "integer", "minimum": 1},
     "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
     "artifact_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "qa_status": {"type": "string", "minLength": 1},
+    "qa_status": {
+      "enum": ["pass", "fail", "insufficient_evidence"]
+    },
     "product_complete": {"type": "boolean"},
     "verified_records": {
       "type": "array",
@@ -28,6 +30,15 @@
       "items": {"$ref": "#/$defs/gap_record"}
     },
     "planner_handoff": {"$ref": "#/$defs/planner_handoff"}
+  },
+  "if": {
+    "properties": {"product_complete": {"const": true}},
+    "required": ["product_complete"]
+  },
+  "then": {
+    "properties": {
+      "verified_records": {"minItems": 1}
+    }
   },
   "$defs": {
     "execution_record": {

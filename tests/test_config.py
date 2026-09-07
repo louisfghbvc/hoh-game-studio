@@ -138,6 +138,32 @@ def test_doctor_accepts_a_registry_with_a_required_claim(tmp_path: Path) -> None
     assert doctor(load_config(tmp_path)) == ()
 
 
+def test_doctor_blocks_duplicate_requirement_claim_ids(tmp_path: Path) -> None:
+    git_init(tmp_path)
+    initialize_project(tmp_path, "command", "test-model", "high")
+    requirements = tmp_path / ".hoh" / "requirements.json"
+    requirements.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "claims": [
+                    {"id": "boot", "description": "The product boots.", "required": True},
+                    {"id": "boot", "description": "The product starts.", "required": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert doctor(load_config(tmp_path)) == (
+        Diagnostic(
+            "requirements:duplicate-claim-id",
+            "blocked",
+            "requirements.json must not contain duplicate claim IDs: boot",
+        ),
+    )
+
+
 def test_domain_records_are_immutable() -> None:
     diagnostic = Diagnostic("config", "info", "ready")
 
