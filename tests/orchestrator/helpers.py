@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -286,6 +287,8 @@ def build_services(
     adapter: RecordingAdapter,
     *,
     config: HarnessConfig | None = None,
+    policy: StopPolicy | None = None,
+    orchestrator_options: Mapping[str, object] | None = None,
 ) -> Services:
     resolved_config = config or config_for(project)
     git = GitService(project)
@@ -298,7 +301,8 @@ def build_services(
         git,
         store,
         SkillRegistry.load(skill_root),
-        StopPolicy(resolved_config),
+        policy or StopPolicy(resolved_config),
+        **dict(orchestrator_options or {}),
     )
     return Services(orchestrator, backend, adapter, git)
 

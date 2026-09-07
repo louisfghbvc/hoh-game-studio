@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -41,7 +42,7 @@ from hoh.state.store import (
     StateStore,
     atomic_write_json,
 )
-from hoh.vcs.git import GitError, GitService, ProtectedPathError
+from hoh.vcs.git import GitError, GitService, PreparedCommit, ProtectedPathError
 from hoh.vcs.worktree import QaWorktree, QaWorktreeCleanupError
 
 
@@ -186,13 +187,33 @@ class HoHOrchestrator:
         run_id = _required_text(run_state, "run_id")
         lock.acquire()
         started = self._monotonic()
+        persisted = run_state.get("elapsed_seconds", 0)
+        persisted_seconds = (
+            persisted
+            if isinstance(persisted, int)
+            and not isinstance(persisted, bool)
+            and persisted >= 0
+            else 0
+        )
+        elapsed_base = max(
+            persisted_seconds, self._elapsed_from_timestamp(run_state)
+        )
         try:
             while True:
                 loop_index = _required_positive_int(run_state, "active_loop")
                 loop_record, decision = self._execute_loop(
-                    run_dir, run_state, loop_index, started
+                    run_dir, run_state, loop_index, started, elapsed_base
                 )
-                self._record_closed_loop(run_dir, run_state, loop_record, decision)
+                elapsed_seconds = self._elapsed_seconds(
+                    run_state, started, elapsed_base
+                )
+                self._record_closed_loop(
+                    run_dir,
+                    run_state,
+                    loop_record,
+                    decision,
+                    elapsed_seconds,
+                )
                 if decision.should_stop:
                     return self._terminal_result(run_dir, run_state, decision)
                 run_state["active_loop"] = loop_index + 1
@@ -210,6 +231,7 @@ class HoHOrchestrator:
         run_state: dict[str, object],
         loop_index: int,
         started: float,
+        elapsed_base: int,
     ) -> tuple[dict[str, object], StopDecision]:
         run_id = _required_text(run_state, "run_id")
         loop_dir = run_dir / "loops" / f"loop-{loop_index:04d}"
@@ -250,6 +272,7 @@ class HoHOrchestrator:
             checks,
             qa,
             started,
+            elapsed_base,
         )
 
     def _ensure_preflight(self, run_id: str, loop_index: int) -> None:
@@ -410,29 +433,54 @@ class HoHOrchestrator:
         report = _required_mapping(development, "report")
         summary = _required_text(report, "summary")
         base_sha = _required_text(development, "base_sha")
-        head_sha = self.git.head_sha()
-        if head_sha == base_sha:
-            candidate_sha = self.git.commit_candidate(loop_index, summary)
-        elif self._is_direct_child(head_sha, base_sha):
-            # The candidate commit may have reached Git immediately before the
-            # process died, leaving the atomic phase journal one step behind.
-            # Developer invocations protect .git, so a single direct child is
-            # the only safe commit-shaped crash window to recover here.
-            candidate_sha = head_sha
-        else:
+        changed_paths = list(_string_sequence(development.get("changed_paths")))
+        intent_path = loop_dir / "candidate-commit-intent.json"
+        prepared = self._load_commit_intent(
+            intent_path,
+            expected_kind="candidate",
+            expected_loop_index=loop_index,
+            expected_parent_sha=base_sha,
+            expected_selected_paths=changed_paths,
+            expected_selected_hashes={},
+        )
+        if prepared is None:
+            if self.git.head_sha() != base_sha:
+                raise StateConflictError(
+                    "Git HEAD moved before candidate commit intent was durable"
+                )
+            prepared = self.git.prepare_candidate(loop_index, summary)
+            if prepared.parent_sha != base_sha:
+                raise StateConflictError(
+                    "prepared candidate has a different expected parent"
+                )
+            self._write_commit_intent(
+                intent_path,
+                prepared,
+                changed_paths,
+                {},
+            )
+        try:
+            candidate_sha = self.git.land_prepared_commit(prepared)
+        except GitError as error:
             raise StateConflictError(
-                "Git HEAD cannot be reconciled with the incomplete candidate phase"
+                "Git HEAD does not match the durable prepared candidate intent"
+            ) from error
+        if self._production_changed_paths(candidate_sha):
+            raise StateConflictError(
+                "working production files do not match the prepared candidate"
             )
         tree_id = self.git.rev_parse_in(
             self.config.project, f"{candidate_sha}^{{tree}}"
         )
+        if tree_id != prepared.tree_sha:
+            raise StateConflictError("prepared candidate tree identity changed")
         candidate = {
             "schema_version": 1,
             "run_id": run_id,
             "loop_index": loop_index,
             "candidate_sha": candidate_sha,
             "artifact_tree_sha256": hashlib.sha256(tree_id.encode("ascii")).hexdigest(),
-            "changed_paths": list(_string_sequence(development.get("changed_paths"))),
+            "changed_paths": changed_paths,
         }
         candidate_path = loop_dir / "candidate.json"
         atomic_write_json(candidate_path, candidate)
@@ -855,6 +903,7 @@ class HoHOrchestrator:
         checks: dict[str, object],
         qa: dict[str, object],
         started: float,
+        elapsed_base: int,
     ) -> tuple[dict[str, object], StopDecision]:
         payload = self._phase_payload(run_id, loop_index, Phase.CLOSURE)
         if payload is not None:
@@ -918,7 +967,7 @@ class HoHOrchestrator:
             *_mapping_records(run_state.get("receipts")),
             *attempts,
         ]
-        elapsed_seconds = self._elapsed_seconds(run_state, started)
+        elapsed_seconds = self._elapsed_seconds(run_state, started, elapsed_base)
         total_tokens = _total_tokens(all_receipts)
         decision = self.policy.evaluate(
             [*previous, loop_record],
@@ -944,18 +993,42 @@ class HoHOrchestrator:
         best_path = self.config.project / ".hoh" / "best-candidate.json"
         if best_path.is_file():
             selected.append(best_path)
-        head_sha = self.git.head_sha()
-        if head_sha == candidate_sha:
-            evidence_commit = self.git.commit_evidence(loop_index, tuple(selected))
-        elif self._is_direct_child(head_sha, candidate_sha):
-            # As with candidate creation, Git can be durable before the phase
-            # journal.  Reuse that exact direct child instead of creating a
-            # duplicate evidence commit on resume.
-            evidence_commit = head_sha
-        else:
-            raise StateConflictError(
-                "Git HEAD cannot be reconciled with the incomplete closure phase"
+        selected = sorted(set(selected), key=lambda path: path.as_posix())
+        selected_paths = [self._project_relative(path) for path in selected]
+        selected_hashes = {
+            self._project_relative(path): _file_sha256(path) for path in selected
+        }
+        intent_path = loop_dir / "evidence-commit-intent.json"
+        prepared = self._load_commit_intent(
+            intent_path,
+            expected_kind="evidence",
+            expected_loop_index=loop_index,
+            expected_parent_sha=candidate_sha,
+            expected_selected_paths=selected_paths,
+            expected_selected_hashes=selected_hashes,
+        )
+        if prepared is None:
+            if self.git.head_sha() != candidate_sha:
+                raise StateConflictError(
+                    "Git HEAD moved before evidence commit intent was durable"
+                )
+            prepared = self.git.prepare_evidence(loop_index, tuple(selected))
+            if prepared.parent_sha != candidate_sha:
+                raise StateConflictError(
+                    "prepared evidence has a different expected parent"
+                )
+            self._write_commit_intent(
+                intent_path,
+                prepared,
+                selected_paths,
+                selected_hashes,
             )
+        try:
+            evidence_commit = self.git.land_prepared_commit(prepared)
+        except GitError as error:
+            raise StateConflictError(
+                "Git HEAD does not match the durable prepared evidence intent"
+            ) from error
         loop_record["evidence_commit_sha"] = evidence_commit
         atomic_write_json(loop_record_path, loop_record)
         closure_payload = {
@@ -1043,9 +1116,23 @@ class HoHOrchestrator:
         read_only_workspace: Path | None = None,
         response_validator: Callable[[Mapping[str, object]], None] | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
-        current_prompt = prompt
         maximum_attempts = 1 + min(self.config.max_role_retries, 1)
-        for invocation_number in range(1, maximum_attempts + 1):
+        durable_attempts = self._validated_role_attempts(
+            run_id, loop_index, loop_dir, role, invocation_kind
+        )
+        attempts_used = len(durable_attempts)
+        if attempts_used >= maximum_attempts:
+            raise StateConflictError(
+                f"durable {role.value} {invocation_kind} receipt history exhausts "
+                "the total attempt allowance"
+            )
+        current_prompt = (
+            self._resume_retry_prompt(prompt, durable_attempts[-1])
+            if durable_attempts
+            else prompt
+        )
+        while attempts_used < maximum_attempts:
+            attempt = attempts_used + 1
             protected_snapshot = (
                 self.git.snapshot_paths(protected_paths)
                 if protected_paths is not None
@@ -1066,12 +1153,14 @@ class HoHOrchestrator:
                     workspace,
                     skills,
                     invocation_kind=invocation_kind,
+                    attempt=attempt,
                     protected_snapshot=protected_snapshot,
                     read_only_snapshot=read_only_snapshot,
                     response_validator=response_validator,
                 )
             except _REPAIRABLE_ROLE_ERRORS as error:
-                if invocation_number >= maximum_attempts:
+                attempts_used = attempt
+                if attempts_used >= maximum_attempts:
                     setattr(error, "hoh_repair_exhausted", True)
                     raise
                 current_prompt = self._repair_prompt(prompt, error)
@@ -1088,11 +1177,11 @@ class HoHOrchestrator:
         skills: tuple[SkillDocument, ...],
         *,
         invocation_kind: str,
+        attempt: int,
         protected_snapshot: Mapping[str, str] | None = None,
         read_only_snapshot: tuple[Path, str] | None = None,
         response_validator: Callable[[Mapping[str, object]], None] | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
-        attempt = self._next_attempt(loop_dir, role, invocation_kind)
         invocation_id = (
             f"{run_id}:loop-{loop_index:04d}:{role.value}:{invocation_kind}:"
             f"attempt-{attempt:02d}"
@@ -1127,12 +1216,36 @@ class HoHOrchestrator:
             if invocation_kind == "ordinary"
             else f"{role.value}-{invocation_kind}-attempt-{attempt:02d}.json"
         )
+        result: AgentResult | None = None
+        backend_error: BaseException | None = None
         try:
             result = self.backend.run(request)
         except BaseException as error:
-            if protected_snapshot is not None:
-                self.git.assert_snapshot_unchanged(protected_snapshot)
-            self._assert_read_only_snapshot(read_only_snapshot)
+            backend_error = error
+
+        boundary_error = self._invocation_boundary_error(
+            protected_snapshot, read_only_snapshot
+        )
+        if boundary_error is not None:
+            self._retain_violation_audit(
+                run_id,
+                loop_index,
+                role,
+                invocation_kind,
+                attempt,
+                invocation_id,
+                prompt,
+                request,
+                skills,
+                result,
+                staged_events,
+                event_name,
+                receipt_path.name,
+                boundary_error,
+            )
+            raise boundary_error
+
+        if backend_error is not None:
             retained_events = loop_dir / event_name
             self._import_event_stream(staged_events, retained_events)
             receipt = self._receipt(
@@ -1146,14 +1259,13 @@ class HoHOrchestrator:
                 None,
                 retained_events,
                 outcome="error",
-                error=error,
+                error=backend_error,
             )
             atomic_write_json(receipt_path, receipt)
-            raise
+            raise backend_error
 
-        if protected_snapshot is not None:
-            self.git.assert_snapshot_unchanged(protected_snapshot)
-        self._assert_read_only_snapshot(read_only_snapshot)
+        if result is None:  # pragma: no cover - guards the result/error invariant
+            raise AssertionError("backend returned neither a result nor an error")
         retained_events = loop_dir / event_name
         self._import_event_stream(staged_events, retained_events)
         try:
@@ -1192,6 +1304,67 @@ class HoHOrchestrator:
         atomic_write_json(receipt_path, receipt)
         return dict(result.response), receipt
 
+    def _invocation_boundary_error(
+        self,
+        protected_snapshot: Mapping[str, str] | None,
+        read_only_snapshot: tuple[Path, str] | None,
+    ) -> BaseException | None:
+        try:
+            if protected_snapshot is not None:
+                self.git.assert_snapshot_unchanged(protected_snapshot)
+            self._assert_read_only_snapshot(read_only_snapshot)
+        except BaseException as error:
+            return error
+        return None
+
+    def _retain_violation_audit(
+        self,
+        run_id: str,
+        loop_index: int,
+        role: Role,
+        invocation_kind: str,
+        attempt: int,
+        invocation_id: str,
+        prompt: str,
+        request: AgentRequest,
+        skills: tuple[SkillDocument, ...],
+        result: AgentResult | None,
+        staged_events: Path,
+        event_name: str,
+        receipt_name: str,
+        error: BaseException,
+    ) -> None:
+        """Retain boundary-failure audit outside the now-untrusted product tree."""
+
+        audit_dir = (
+            self._host_staging_root
+            / run_id
+            / f"loop-{loop_index:04d}"
+            / "audit"
+        )
+        retained_events = audit_dir / event_name
+        data = staged_events.read_bytes() if staged_events.exists() else b""
+        self._atomic_write_bytes(retained_events, data)
+        staged_events.unlink(missing_ok=True)
+        event_location = (
+            "host-staging/"
+            + retained_events.relative_to(self._host_staging_root).as_posix()
+        )
+        receipt = self._receipt(
+            invocation_id,
+            role,
+            invocation_kind,
+            attempt,
+            prompt,
+            request,
+            skills,
+            result,
+            event_location,
+            outcome="policy_violation",
+            error=error,
+        )
+        atomic_write_json(audit_dir / "receipts" / receipt_name, receipt)
+
     @staticmethod
     def _assert_read_only_snapshot(
         snapshot: tuple[Path, str] | None,
@@ -1217,6 +1390,33 @@ class HoHOrchestrator:
             + prompt
         )
 
+    @staticmethod
+    def _resume_retry_prompt(
+        prompt: str, prior_receipt: Mapping[str, object]
+    ) -> str:
+        outcome = prior_receipt.get("outcome")
+        if outcome not in {"success", "schema_invalid", "error"}:
+            raise StateConflictError(
+                "durable receipt outcome does not permit a resumed invocation"
+            )
+        if outcome == "error":
+            error = prior_receipt.get("error")
+            if not isinstance(error, Mapping) or error.get("type") not in {
+                BackendTimeout.__name__,
+                BackendProcessError.__name__,
+            }:
+                raise StateConflictError(
+                    "durable receipt records a non-repairable role failure"
+                )
+        return (
+            "# CRASH-SAFE FRESH RETRY\n\n"
+            "A prior invocation has a durable receipt, but this phase did not "
+            "complete. This is the final allowed fresh attempt. Re-evaluate the "
+            "supplied public context and return only output conforming to the "
+            "required schema.\n\n"
+            + prompt
+        )
+
     def _receipt(
         self,
         invocation_id: str,
@@ -1227,7 +1427,7 @@ class HoHOrchestrator:
         request: AgentRequest,
         skills: tuple[SkillDocument, ...],
         result: AgentResult | None,
-        events_path: Path,
+        events_path: Path | str,
         *,
         outcome: str,
         error: BaseException | None,
@@ -1245,7 +1445,11 @@ class HoHOrchestrator:
             "timeout_seconds": request.timeout_seconds,
             "schema_path": request.schema_path.name,
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-            "events_path": self._project_relative(events_path),
+            "events_path": (
+                events_path
+                if isinstance(events_path, str)
+                else self._project_relative(events_path)
+            ),
             "skills": [
                 {
                     "skill_id": skill.skill_id,
@@ -1487,6 +1691,86 @@ class HoHOrchestrator:
         except GitError:
             return False
 
+    def _write_commit_intent(
+        self,
+        path: Path,
+        prepared: PreparedCommit,
+        selected_paths: Sequence[str],
+        selected_hashes: Mapping[str, str],
+    ) -> None:
+        atomic_write_json(
+            path,
+            {
+                "schema_version": 1,
+                "kind": prepared.kind,
+                "loop_index": prepared.loop_index,
+                "parent_sha": prepared.parent_sha,
+                "prepared_sha": prepared.commit_sha,
+                "tree_sha": prepared.tree_sha,
+                "selected_paths": list(selected_paths),
+                "selected_sha256": dict(sorted(selected_hashes.items())),
+            },
+        )
+
+    def _load_commit_intent(
+        self,
+        path: Path,
+        *,
+        expected_kind: str,
+        expected_loop_index: int,
+        expected_parent_sha: str,
+        expected_selected_paths: Sequence[str],
+        expected_selected_hashes: Mapping[str, str],
+    ) -> PreparedCommit | None:
+        if not path.exists():
+            return None
+        try:
+            document = _read_json(path)
+            allowed = {
+                "schema_version",
+                "kind",
+                "loop_index",
+                "parent_sha",
+                "prepared_sha",
+                "tree_sha",
+                "selected_paths",
+                "selected_sha256",
+            }
+            if set(document) != allowed or document.get("schema_version") != 1:
+                raise StateConflictError("durable commit intent schema is malformed")
+            selected_paths = list(_string_sequence(document.get("selected_paths")))
+            selected_hashes_raw = document.get("selected_sha256")
+            if not isinstance(selected_hashes_raw, Mapping) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in selected_hashes_raw.items()
+            ):
+                raise StateConflictError(
+                    "durable commit intent selected hashes are malformed"
+                )
+            selected_hashes = dict(sorted(selected_hashes_raw.items()))
+            if (
+                document.get("kind") != expected_kind
+                or document.get("loop_index") != expected_loop_index
+                or document.get("parent_sha") != expected_parent_sha
+                or selected_paths != list(expected_selected_paths)
+                or selected_hashes != dict(sorted(expected_selected_hashes.items()))
+            ):
+                raise StateConflictError(
+                    f"durable {expected_kind} commit intent conflicts with host inputs"
+                )
+            prepared = PreparedCommit(
+                kind=_required_text(document, "kind"),
+                loop_index=_required_positive_int(document, "loop_index"),
+                parent_sha=_required_text(document, "parent_sha"),
+                commit_sha=_required_text(document, "prepared_sha"),
+                tree_sha=_required_text(document, "tree_sha"),
+            )
+        except (json.JSONDecodeError, OSError, StateError, ValueError, TypeError) as error:
+            if isinstance(error, StateConflictError):
+                raise
+            raise StateConflictError("durable commit intent is malformed") from error
+        return prepared
+
     @staticmethod
     def _require_candidate_binding(
         record: Mapping[str, object], candidate: Mapping[str, object]
@@ -1516,16 +1800,102 @@ class HoHOrchestrator:
         ]
         return sorted(receipts, key=_receipt_sort_key)
 
-    def _next_attempt(self, loop_dir: Path, role: Role, kind: str) -> int:
+    def _validated_role_attempts(
+        self,
+        run_id: str,
+        loop_index: int,
+        loop_dir: Path,
+        role: Role,
+        kind: str,
+    ) -> list[dict[str, object]]:
         prefix = f"{role.value}-" if kind == "ordinary" else f"{role.value}-{kind}-"
-        existing = list((loop_dir / "receipts").glob(f"{prefix}attempt-*.json"))
-        return len(existing) + 1
+        external_receipts = (
+            self._host_staging_root
+            / run_id
+            / f"loop-{loop_index:04d}"
+            / "audit"
+            / "receipts"
+        )
+        receipt_paths = [
+            *(loop_dir / "receipts").glob(f"{prefix}attempt-*.json"),
+            *external_receipts.glob(f"{prefix}attempt-*.json"),
+        ]
+        indexed_paths: list[tuple[int, Path]] = []
+        for path in receipt_paths:
+            match = re.fullmatch(
+                rf"{re.escape(prefix)}attempt-(\d+)\.json", path.name
+            )
+            if match is None:
+                raise StateConflictError(
+                    f"durable {role.value} receipt filename is malformed"
+                )
+            indexed_paths.append((int(match.group(1)), path))
+        indexed_paths.sort(key=lambda item: (item[0], item[1].as_posix()))
+        receipts: list[dict[str, object]] = []
+        for expected_attempt, (recorded_attempt, path) in enumerate(
+            indexed_paths, start=1
+        ):
+            if recorded_attempt != expected_attempt:
+                raise StateConflictError(
+                    f"durable {role.value} receipt attempt sequence is ambiguous"
+                )
+            try:
+                receipt = _read_json(path)
+            except (OSError, json.JSONDecodeError, StateError) as error:
+                raise StateConflictError(
+                    f"durable {role.value} receipt history is malformed"
+                ) from error
+            invocation_id = (
+                f"{run_id}:loop-{loop_index:04d}:{role.value}:{kind}:"
+                f"attempt-{expected_attempt:02d}"
+            )
+            outcome = receipt.get("outcome")
+            recorded_metadata_attempt = receipt.get("attempt")
+            executable_version = receipt.get("executable_version")
+            if (
+                receipt.get("invocation_id") != invocation_id
+                or receipt.get("role") != role.value
+                or receipt.get("kind") != kind
+                or isinstance(recorded_metadata_attempt, bool)
+                or not isinstance(recorded_metadata_attempt, int)
+                or recorded_metadata_attempt != expected_attempt
+                or outcome not in {
+                    "success",
+                    "schema_invalid",
+                    "error",
+                    "policy_violation",
+                }
+                or not isinstance(executable_version, str)
+                or not executable_version.strip()
+            ):
+                raise StateConflictError(
+                    f"durable {role.value} receipt attempt metadata is malformed"
+                )
+            if outcome == "success":
+                if "error" in receipt:
+                    raise StateConflictError(
+                        f"durable {role.value} success receipt is ambiguous"
+                    )
+            else:
+                error = receipt.get("error")
+                if (
+                    not isinstance(error, Mapping)
+                    or not isinstance(error.get("type"), str)
+                    or not isinstance(error.get("message"), str)
+                    or not str(error.get("type")).strip()
+                ):
+                    raise StateConflictError(
+                        f"durable {role.value} failure receipt is malformed"
+                    )
+            receipts.append(receipt)
+        return receipts
 
     def _evidence_commit_paths(self, loop_dir: Path) -> list[Path]:
         selected_names = {
             "plan.json",
             "developer-report.json",
             "candidate.json",
+            "candidate-commit-intent.json",
             "baseline-checks.json",
             "checks.json",
             "adapter-manifest.json",
@@ -1557,6 +1927,7 @@ class HoHOrchestrator:
         run_state: dict[str, object],
         loop_record: dict[str, object],
         decision: StopDecision,
+        elapsed_seconds: int,
     ) -> None:
         loop_index = _required_positive_int(loop_record, "loop_index")
         loops = _mapping_records(run_state.get("loops"))
@@ -1581,7 +1952,7 @@ class HoHOrchestrator:
         run_state["current_candidate"] = loop_record.get("candidate_sha")
         if decision.terminal_status == "complete":
             run_state["best_candidate"] = loop_record.get("candidate_sha")
-        run_state["elapsed_seconds"] = self._elapsed_from_timestamp(run_state)
+        run_state["elapsed_seconds"] = elapsed_seconds
         run_state["status"] = (
             decision.terminal_status if decision.should_stop else "running"
         )
@@ -1693,8 +2064,13 @@ class HoHOrchestrator:
         atomic_write_json(run_dir / "run.json", run_state)
 
     def _import_event_stream(self, staged: Path, destination: Path) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
         data = staged.read_bytes() if staged.exists() else b""
+        self._atomic_write_bytes(destination, data)
+        staged.unlink(missing_ok=True)
+
+    @staticmethod
+    def _atomic_write_bytes(destination: Path, data: bytes) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -1712,7 +2088,6 @@ class HoHOrchestrator:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-            staged.unlink(missing_ok=True)
 
     def _project_relative(self, path: Path) -> str:
         return path.resolve().relative_to(self.config.project.resolve()).as_posix()
@@ -1724,10 +2099,13 @@ class HoHOrchestrator:
             raise ValueError("max_loops must be a positive integer")
         return min(supplied, self.config.max_loops)
 
-    def _elapsed_seconds(self, run_state: Mapping[str, object], started: float) -> int:
-        prior = run_state.get("elapsed_seconds", 0)
-        prior_seconds = prior if isinstance(prior, int) and not isinstance(prior, bool) else 0
-        session_elapsed = prior_seconds + max(0, int(self._monotonic() - started))
+    def _elapsed_seconds(
+        self,
+        run_state: Mapping[str, object],
+        started: float,
+        elapsed_base: int,
+    ) -> int:
+        session_elapsed = elapsed_base + max(0, int(self._monotonic() - started))
         return max(session_elapsed, self._elapsed_from_timestamp(run_state))
 
     def _elapsed_from_timestamp(self, run_state: Mapping[str, object]) -> int:

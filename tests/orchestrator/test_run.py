@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,9 @@ from hoh.backends import (
 )
 from hoh.models import Role, Sandbox
 from hoh.orchestrator import PreflightError, RoleOutputError
+from hoh.policy import StopPolicy
 from hoh.state.evidence import EvidenceBindingError
+from hoh.state.store import StateConflictError
 from hoh.vcs.git import ProtectedPathError
 
 from tests.orchestrator.helpers import (
@@ -20,6 +23,7 @@ from tests.orchestrator.helpers import (
     RecordingAdapter,
     ScriptedBackend,
     build_services,
+    config_for,
     count_candidate_commits,
     developer_change,
     developer_response,
@@ -29,6 +33,46 @@ from tests.orchestrator.helpers import (
     qa_response,
     run_git,
 )
+
+
+class MutableClock:
+    def __init__(self) -> None:
+        self.elapsed = 0.0
+        self.epoch = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def now(self) -> datetime:
+        return self.epoch + timedelta(seconds=self.elapsed)
+
+    def advance(self, seconds: float) -> None:
+        self.elapsed += seconds
+
+
+class RecordingPolicy:
+    def __init__(self, delegate: StopPolicy) -> None:
+        self.delegate = delegate
+        self.elapsed_seconds: list[int] = []
+
+    def evaluate(self, history, **kwargs):
+        self.elapsed_seconds.append(kwargs.get("elapsed_seconds", 0))
+        return self.delegate.evaluate(history, **kwargs)
+
+
+def assert_host_violation_audit(
+    host_root: Path, project: Path, role: str
+) -> dict[str, object]:
+    run_dir = next((project / ".hoh" / "runs").iterdir())
+    audit = host_root / run_dir.name / "loop-0001" / "audit"
+    assert (audit / f"{role}-events-attempt-01.jsonl").is_file()
+    receipt_path = audit / "receipts" / f"{role}-attempt-01.json"
+    assert receipt_path.is_file()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "policy_violation"
+    assert receipt["error"]["type"] in {"ProtectedPathError", "RoleOutputError"}
+    assert receipt["executable_version"] == "fake-agent/1"
+    return receipt
 
 
 def test_one_loop_calls_roles_in_order_and_freezes_qa(tmp_path: Path) -> None:
@@ -181,6 +225,44 @@ def test_developer_protected_path_change_is_rejected_before_candidate_commit(
     state = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     assert state["status"] == "blocked"
     assert state["failure"]["category"] == "protocol"
+
+
+def test_developer_protected_path_violation_retains_external_event_and_receipt(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    host_root = tmp_path / "trusted-host-audit"
+
+    def violate_protected_path(request) -> None:
+        developer_change(request)
+        (request.workspace / "raw-agent-response.json").write_text(
+            '{"untrusted": true}\n', encoding="utf-8"
+        )
+        (request.workspace / ".hoh" / "prd.md").write_text(
+            "untrusted host-state mutation\n", encoding="utf-8"
+        )
+
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=violate_protected_path),
+        ]
+    )
+    services = build_services(
+        project,
+        backend,
+        RecordingAdapter(),
+        orchestrator_options={"host_staging_root": host_root},
+    )
+
+    with pytest.raises(ProtectedPathError, match=r"\.hoh"):
+        services.orchestrator.run(max_loops=1)
+
+    receipt = assert_host_violation_audit(host_root, project, "developer")
+    assert receipt["role"] == "developer"
+    assert "raw-agent-response.json" not in run_git(
+        project, "ls-tree", "-r", "--name-only", "HEAD"
+    ).splitlines()
 
 
 def test_qa_observes_detached_candidate_and_worktree_is_removed(tmp_path: Path) -> None:
@@ -472,6 +554,135 @@ def test_planner_write_attempt_is_rejected_before_developer_runs(tmp_path: Path)
 
     assert [request.role for request in backend.requests] == [Role.PLANNER]
     assert count_candidate_commits(project) == 0
+
+
+def test_planner_read_only_violation_retains_external_event_and_receipt(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    host_root = tmp_path / "trusted-host-audit"
+
+    def planner_write(request) -> None:
+        developer_change(request, "planner-write\n")
+        (request.workspace / "raw-agent-response.json").write_text(
+            '{"untrusted": true}\n', encoding="utf-8"
+        )
+
+    backend = FakeAgentBackend([FakeResponse(plan(), on_run=planner_write)])
+    services = build_services(
+        project,
+        backend,
+        RecordingAdapter(),
+        orchestrator_options={"host_staging_root": host_root},
+    )
+
+    with pytest.raises(RoleOutputError, match="read-only"):
+        services.orchestrator.run(max_loops=1)
+
+    receipt = assert_host_violation_audit(host_root, project, "planner")
+    assert receipt["role"] == "planner"
+    assert "raw-agent-response.json" not in run_git(
+        project, "ls-tree", "-r", "--name-only", "HEAD"
+    ).splitlines()
+    run_path = next((project / ".hoh" / "runs").glob("*/run.json"))
+    state = json.loads(run_path.read_text(encoding="utf-8"))
+    state["status"] = "running"
+    run_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(StateConflictError, match="receipt|outcome|invocation"):
+        services.orchestrator.resume()
+
+    assert len(backend.requests) == 1
+
+
+def test_qa_read_only_violation_retains_external_event_and_receipt(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    host_root = tmp_path / "trusted-host-audit"
+
+    def qa_write(request) -> None:
+        (request.workspace / "product.txt").write_text("qa-write\n", encoding="utf-8")
+        (request.workspace / "raw-agent-response.json").write_text(
+            '{"untrusted": true}\n', encoding="utf-8"
+        )
+
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response, on_run=qa_write),
+        ]
+    )
+    services = build_services(
+        project,
+        backend,
+        RecordingAdapter(),
+        orchestrator_options={"host_staging_root": host_root},
+    )
+
+    with pytest.raises(RoleOutputError, match="read-only"):
+        services.orchestrator.run(max_loops=1)
+
+    receipt = assert_host_violation_audit(host_root, project, "qa")
+    assert receipt["role"] == "qa"
+    assert not any((project / ".hoh" / "tmp").glob("qa-*"))
+    assert "raw-agent-response.json" not in run_git(
+        project, "ls-tree", "-r", "--name-only", "HEAD"
+    ).splitlines()
+
+
+def test_elapsed_time_is_not_double_counted_across_continuous_loops(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    clock = MutableClock()
+    config = config_for(project)
+    policy = RecordingPolicy(StopPolicy(config))
+
+    def change_for(index: int):
+        def change(request) -> None:
+            developer_change(request, f"changed-{index}\n")
+            clock.advance(30)
+
+        return change
+
+    def qa_for(index: int):
+        def respond(request):
+            clock.advance(30)
+            return qa_response(request, iteration=index)
+
+        return respond
+
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan(1)),
+            FakeResponse(developer_response("loop one"), on_run=change_for(1)),
+            FakeResponse(qa_for(1)),
+            FakeResponse(plan(2)),
+            FakeResponse(developer_response("loop two"), on_run=change_for(2)),
+            FakeResponse(qa_for(2)),
+        ]
+    )
+    services = build_services(
+        project,
+        backend,
+        RecordingAdapter(),
+        config=config,
+        policy=policy,  # type: ignore[arg-type]
+        orchestrator_options={"now": clock.now, "monotonic": clock.monotonic},
+    )
+
+    result = services.orchestrator.run(max_loops=2)
+
+    assert result["loops_completed"] == 2
+    assert policy.elapsed_seconds == [60, 120]
+    run_state = json.loads(
+        (
+            project / ".hoh" / "runs" / result["run_id"] / "run.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert run_state["elapsed_seconds"] == 120
 
 
 def test_evidence_commit_retains_every_cited_adapter_artifact(tmp_path: Path) -> None:

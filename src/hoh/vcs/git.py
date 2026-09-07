@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import tempfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -19,6 +21,17 @@ class DirtyWorktreeError(GitError):
 
 class ProtectedPathError(GitError):
     """Raised when a host-owned path changed across an agent invocation."""
+
+
+@dataclass(frozen=True)
+class PreparedCommit:
+    """An exact commit object created without moving the checked-out branch."""
+
+    kind: str
+    loop_index: int
+    parent_sha: str
+    commit_sha: str
+    tree_sha: str
 
 
 class GitService:
@@ -98,6 +111,13 @@ class GitService:
     def commit_candidate(self, loop_index: int, summary: str) -> str:
         """Commit all production changes while excluding host-owned ``.hoh`` state."""
 
+        return self.land_prepared_commit(
+            self.prepare_candidate(loop_index, summary)
+        )
+
+    def prepare_candidate(self, loop_index: int, summary: str) -> PreparedCommit:
+        """Create the exact candidate commit object without moving the run branch."""
+
         self._require_run_branch()
         message = f"feat(loop-{self._loop_number(loop_index)}): {self._summary(summary)}"
         staged_host_state = self._split_nul(
@@ -108,26 +128,86 @@ class GitService:
                 "protected path is staged: " + ", ".join(staged_host_state)
             )
         production_pathspec = (".", ":(exclude).hoh", ":(exclude).hoh/**")
-        self._run(("add", "--all", "--", *production_pathspec))
-        self._commit(
+        return self._prepare_commit(
+            "candidate",
+            loop_index,
             message,
             self._DEVELOPER_NAME,
             self._DEVELOPER_EMAIL,
             production_pathspec,
         )
-        return self.head_sha()
 
     def commit_evidence(self, loop_index: int, paths: tuple[Path, ...]) -> str:
         """Commit only host-selected state and evidence paths."""
+
+        return self.land_prepared_commit(
+            self.prepare_evidence(loop_index, paths)
+        )
+
+    def prepare_evidence(
+        self, loop_index: int, paths: tuple[Path, ...]
+    ) -> PreparedCommit:
+        """Create an exact selected-evidence commit without moving the run branch."""
 
         self._require_run_branch()
         selected_paths = self._selected_paths(paths)
         message = (
             f"test(loop-{self._loop_number(loop_index)}): record candidate evidence"
         )
-        self._run(("add", "--all", "--", *selected_paths))
-        self._commit(message, self._QA_NAME, self._QA_EMAIL, selected_paths)
-        return self.head_sha()
+        return self._prepare_commit(
+            "evidence",
+            loop_index,
+            message,
+            self._QA_NAME,
+            self._QA_EMAIL,
+            selected_paths,
+        )
+
+    def land_prepared_commit(self, prepared: PreparedCommit) -> str:
+        """Move the run ref to exactly *prepared*, using its parent as a CAS guard."""
+
+        if not isinstance(prepared, PreparedCommit):
+            raise TypeError("prepared must be a PreparedCommit")
+        if prepared.kind not in {"candidate", "evidence"}:
+            raise GitError("prepared commit kind is invalid")
+        if prepared.loop_index < 1:
+            raise GitError("prepared commit loop index is invalid")
+        self._require_run_branch()
+        try:
+            resolved = self.rev_parse_in(self._repository, f"{prepared.commit_sha}^{{commit}}")
+            parent = self.rev_parse_in(self._repository, f"{prepared.commit_sha}^")
+            tree = self.rev_parse_in(self._repository, f"{prepared.commit_sha}^{{tree}}")
+        except GitError as error:
+            raise GitError("prepared commit object cannot be resolved") from error
+        if (
+            resolved != prepared.commit_sha
+            or parent != prepared.parent_sha
+            or tree != prepared.tree_sha
+        ):
+            raise GitError("prepared commit identity does not match its object")
+
+        head = self.head_sha()
+        if head == prepared.parent_sha:
+            self._run(
+                (
+                    "update-ref",
+                    "HEAD",
+                    prepared.commit_sha,
+                    prepared.parent_sha,
+                )
+            )
+        elif head != prepared.commit_sha:
+            raise GitError(
+                "Git HEAD is neither the prepared commit nor its expected parent"
+            )
+
+        # Preparation uses an isolated index.  Reconcile the real index after
+        # the compare-and-swap; repeating this also repairs a crash immediately
+        # after update-ref without touching working-tree files.
+        self._run(("reset", "--mixed", prepared.commit_sha))
+        if self.head_sha() != prepared.commit_sha:
+            raise GitError("Git HEAD did not land on the prepared commit")
+        return prepared.commit_sha
 
     def rev_parse_in(self, worktree: Path, revision: str) -> str:
         """Resolve *revision* from a specific worktree."""
@@ -152,27 +232,59 @@ class GitService:
     def _prune_worktrees(self) -> None:
         self._run(("worktree", "prune"))
 
-    def _commit(
+    def _prepare_commit(
         self,
+        kind: str,
+        loop_index: int,
         message: str,
         author_name: str,
         author_email: str,
         paths: Sequence[str],
-    ) -> None:
-        self._run(
-            (
-                "-c",
-                f"user.name={author_name}",
-                "-c",
-                f"user.email={author_email}",
-                "commit",
-                "--only",
-                "-m",
-                message,
-                "--",
-                *paths,
-            )
+    ) -> PreparedCommit:
+        parent_sha = self.head_sha()
+        parent_tree = self.rev_parse_in(self._repository, f"{parent_sha}^{{tree}}")
+        index_path = self._temporary_index_path()
+        environment = {
+            "GIT_INDEX_FILE": str(index_path),
+            "GIT_AUTHOR_NAME": author_name,
+            "GIT_AUTHOR_EMAIL": author_email,
+            "GIT_COMMITTER_NAME": author_name,
+            "GIT_COMMITTER_EMAIL": author_email,
+        }
+        try:
+            self._run(("read-tree", parent_sha), env=environment)
+            self._run(("add", "--all", "--", *paths), env=environment)
+            tree_sha = self._run(("write-tree",), env=environment).strip()
+            if tree_sha == parent_tree:
+                raise GitError(f"prepared {kind} commit has no changes")
+            commit_sha = self._run(
+                ("commit-tree", tree_sha, "-p", parent_sha, "-m", message),
+                env=environment,
+            ).strip()
+        finally:
+            index_path.unlink(missing_ok=True)
+            index_path.with_name(index_path.name + ".lock").unlink(missing_ok=True)
+        return PreparedCommit(
+            kind=kind,
+            loop_index=loop_index,
+            parent_sha=parent_sha,
+            commit_sha=commit_sha,
+            tree_sha=tree_sha,
         )
+
+    def _temporary_index_path(self) -> Path:
+        supplied = self._run(("rev-parse", "--git-path", "index")).strip()
+        real_index = Path(supplied)
+        if not real_index.is_absolute():
+            real_index = self._repository / real_index
+        directory = real_index.resolve().parent
+        descriptor, temporary = tempfile.mkstemp(
+            dir=directory, prefix="hoh-index-", suffix=".tmp"
+        )
+        os.close(descriptor)
+        path = Path(temporary)
+        path.unlink()
+        return path
 
     def _require_run_branch(self) -> None:
         branch = self.current_branch_in(self._repository)
@@ -280,14 +392,25 @@ class GitService:
             raise ValueError("summary must be a non-empty single line")
         return normalized
 
-    def _run(self, args: Sequence[str], *, cwd: Path | None = None) -> str:
+    def _run(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> str:
         working_directory = self._repository if cwd is None else Path(cwd)
+        environment = None
+        if env is not None:
+            environment = os.environ.copy()
+            environment.update(env)
         completed = subprocess.run(
             ["git", *args],
             cwd=working_directory,
             text=True,
             capture_output=True,
             check=False,
+            env=environment,
         )
         if completed.returncode != 0:
             command_name = self._command_name(args)

@@ -77,6 +77,65 @@ def test_candidate_commit_excludes_host_state_and_uses_host_author(tmp_path: Pat
     assert (repo / ".hoh" / "owned.json").is_file()
 
 
+def test_prepared_candidate_is_exact_and_does_not_move_head_until_landed(
+    tmp_path: Path,
+) -> None:
+    repo = initialized_repo(tmp_path)
+    git = GitService(repo)
+    git.create_run_branch("run-abc")
+    parent = git.head_sha()
+    (repo / "product.txt").write_text("changed", encoding="utf-8")
+    (repo / ".hoh").mkdir()
+    (repo / ".hoh" / "scratch.json").write_text("{}", encoding="utf-8")
+
+    prepared = git.prepare_candidate(1, "change product")
+
+    assert git.head_sha() == parent
+    assert prepared.parent_sha == parent
+    assert prepared.commit_sha != parent
+    assert run_git(repo, "show", "-s", "--format=%s", prepared.commit_sha) == (
+        "feat(loop-0001): change product"
+    )
+    assert run_git(repo, "show", "-s", "--format=%an <%ae>", prepared.commit_sha) == (
+        "hoh-developer[bot] <developer@hoh.local>"
+    )
+    assert run_git(repo, "ls-tree", "-r", "--name-only", prepared.commit_sha) == (
+        "product.txt"
+    )
+
+    assert git.land_prepared_commit(prepared) == prepared.commit_sha
+    assert git.head_sha() == prepared.commit_sha
+    assert "product.txt" not in run_git(repo, "status", "--porcelain")
+
+
+def test_landing_prepared_candidate_rejects_an_unexpected_direct_child(
+    tmp_path: Path,
+) -> None:
+    repo = initialized_repo(tmp_path)
+    git = GitService(repo)
+    git.create_run_branch("run-abc")
+    (repo / "product.txt").write_text("intended", encoding="utf-8")
+    prepared = git.prepare_candidate(1, "intended candidate")
+    run_git(
+        repo,
+        "-c",
+        "user.name=external",
+        "-c",
+        "user.email=external@example.test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "unexpected direct child",
+    )
+    external = git.head_sha()
+
+    with pytest.raises(GitError, match="prepared|HEAD|parent"):
+        git.land_prepared_commit(prepared)
+
+    assert git.head_sha() == external
+    assert (repo / "product.txt").read_text(encoding="utf-8") == "intended"
+
+
 def test_candidate_commit_is_rejected_on_the_default_branch(tmp_path: Path) -> None:
     repo = initialized_repo(tmp_path)
     (repo / "product.txt").write_text("changed", encoding="utf-8")
@@ -187,6 +246,34 @@ def test_evidence_commit_contains_only_selected_host_paths(tmp_path: Path) -> No
         "product.txt",
     ]
     assert ".hoh/private.tmp" in run_git(repo, "status", "--porcelain")
+
+
+def test_prepared_evidence_object_contains_only_the_exact_selected_paths(
+    tmp_path: Path,
+) -> None:
+    repo = initialized_repo(tmp_path)
+    git = GitService(repo)
+    git.create_run_branch("run-abc")
+    selected = repo / ".hoh" / "evidence.json"
+    raw_response = repo / ".hoh" / "responses" / "raw.json"
+    selected.parent.mkdir(parents=True)
+    raw_response.parent.mkdir(parents=True)
+    selected.write_text('{"status": "pass"}', encoding="utf-8")
+    raw_response.write_text('{"untrusted": true}', encoding="utf-8")
+
+    prepared = git.prepare_evidence(1, (selected,))
+
+    assert git.head_sha() == prepared.parent_sha
+    committed = run_git(
+        repo, "ls-tree", "-r", "--name-only", prepared.commit_sha
+    ).splitlines()
+    assert ".hoh/evidence.json" in committed
+    assert ".hoh/responses/raw.json" not in committed
+
+    git.land_prepared_commit(prepared)
+    assert ".hoh/responses/raw.json" in run_git(
+        repo, "status", "--porcelain", "--untracked-files=all"
+    )
 
 
 def test_evidence_path_with_pathspec_metacharacters_is_literal(tmp_path: Path) -> None:
