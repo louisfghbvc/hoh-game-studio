@@ -4,11 +4,15 @@ import argparse
 import json
 import subprocess
 import sys
-import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 from hoh.models import Diagnostic, HarnessConfig
 

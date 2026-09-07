@@ -1,12 +1,23 @@
 from dataclasses import FrozenInstanceError
+import os
 from pathlib import Path
 import json
+import subprocess
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10.
+    import tomli as tomllib
 
 import pytest
 
 from hoh.cli import build_parser, main
 from hoh.config import ConfigError, doctor, initialize_project, load_config
 from hoh.models import Diagnostic
+
+
+PROJECT_ROOT = Path(__file__).parents[1]
 
 
 def git_init(path: Path) -> None:
@@ -184,3 +195,65 @@ def test_doctor_command_returns_blocked_exit_code(
 
     assert main(["doctor", "--project", str(tmp_path)]) == 3
     assert "requirements:required-claim" in capsys.readouterr().out
+
+
+def test_python310_installs_tomli_parser_dependency() -> None:
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "tomli>=2.0,<3; python_version < '3.11'" in pyproject["project"]["dependencies"]
+
+
+def test_config_imports_tomli_when_tomllib_is_unavailable(tmp_path: Path) -> None:
+    (tmp_path / "tomli.py").write_text(
+        "class TOMLDecodeError(ValueError):\n    pass\n\n"
+        "def load(file):\n    return {}\n",
+        encoding="utf-8",
+    )
+    script = """
+import builtins
+
+real_import = builtins.__import__
+
+def import_without_tomllib(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "tomllib":
+        raise ModuleNotFoundError("No module named 'tomllib'")
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = import_without_tomllib
+import hoh.config as config
+assert config.tomllib.__name__ == "tomli"
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(tmp_path), str(PROJECT_ROOT / "src"), environment.get("PYTHONPATH", "")]
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_load_config_recursively_freezes_adapter_options(tmp_path: Path) -> None:
+    git_init(tmp_path)
+    initialize_project(tmp_path, "command", "test-model", "high")
+    config_path = tmp_path / ".hoh" / "config.toml"
+    with config_path.open("a", encoding="utf-8") as config_file:
+        config_file.write(
+            "\n[adapter_options.runner]\n"
+            'command = ["python", "-m", "pytest"]\n'
+        )
+
+    config = load_config(tmp_path)
+    runner = config.adapter_options["runner"]
+
+    assert runner["command"] == ("python", "-m", "pytest")  # type: ignore[index]
+    with pytest.raises(TypeError):
+        runner["command"] = ()  # type: ignore[index]
+    with pytest.raises(TypeError):
+        runner["command"][0] = "changed"  # type: ignore[index]
