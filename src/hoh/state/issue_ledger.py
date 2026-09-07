@@ -14,6 +14,10 @@ from hoh.state.store import atomic_write_json
 _ISSUE_STATUSES = frozenset({"open", "closed", "regressed"})
 _GAP_SEVERITIES = frozenset({"blocker", "major", "minor"})
 _ISSUE_TEXT_FIELDS = ("impact", "recommended_update", "validation_requirement")
+_CURRENT_SCHEMA_VERSION = 2
+_LEGACY_SCHEMA_VERSION = 1
+_CORRELATION_START_FIELD = "application_correlation_start_loop"
+_MISSING = object()
 _HISTORY_FIELDS = frozenset(
     {"loop", "candidate", "evidence_path", "observation", "status"}
 )
@@ -54,6 +58,11 @@ class IssueLedger:
         document["applications"] = _validated_applications(
             document.get("applications", [])
         )
+        correlation_start_loop = _validated_correlation_start_loop(
+            document, document["applications"]
+        )
+        if correlation_start_loop is not None:
+            document[_CORRELATION_START_FIELD] = correlation_start_loop
         document["summary"] = _derived_summary(document["issues"])
         return document
 
@@ -72,6 +81,10 @@ class IssueLedger:
         assert isinstance(raw_issues, list)
         applications = document["applications"]
         assert isinstance(applications, list)
+        correlation_start_loop = document.get(_CORRELATION_START_FIELD)
+        assert correlation_start_loop is None or isinstance(
+            correlation_start_loop, int
+        )
         applications_by_loop = {
             application["loop"]: application for application in applications
         }
@@ -102,7 +115,8 @@ class IssueLedger:
                 _validated_history(
                     history,
                     str(status),
-                    applications_by_loop if applications else None,
+                    applications_by_loop,
+                    correlation_start_loop,
                 )
             )
             issues[claim_id] = deepcopy(issue)
@@ -134,6 +148,8 @@ class IssueLedger:
             raise IssueLedgerError(
                 f"loop {loop_index} is out of order after loop {latest_loop}"
             )
+        if correlation_start_loop is None:
+            correlation_start_loop = loop_index if history_loop_indices else 1
 
         for gap in _evidence_records(evidence, "gap_records"):
             claim_id = _record_claim_id(gap)
@@ -193,7 +209,8 @@ class IssueLedger:
             }
         )
         updated: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": _CURRENT_SCHEMA_VERSION,
+            _CORRELATION_START_FIELD: correlation_start_loop,
             "issues": ordered_issues,
             "applications": applications,
             "summary": _derived_summary(ordered_issues),
@@ -309,10 +326,53 @@ def _validated_applications(raw: object) -> list[dict[str, object]]:
     return applications
 
 
+def _validated_correlation_start_loop(
+    document: Mapping[str, object], applications: list[dict[str, object]]
+) -> int | None:
+    schema_version = document.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version not in {_LEGACY_SCHEMA_VERSION, _CURRENT_SCHEMA_VERSION}
+    ):
+        raise IssueLedgerError("issue ledger schema_version is invalid")
+
+    raw_start_loop = document.get(_CORRELATION_START_FIELD, _MISSING)
+    if raw_start_loop is _MISSING:
+        if schema_version == _CURRENT_SCHEMA_VERSION:
+            raise IssueLedgerError(
+                "issue ledger application correlation boundary is missing"
+            )
+        if not applications:
+            return None
+        start_loop = applications[0]["loop"]
+        assert isinstance(start_loop, int)
+        return start_loop
+
+    if (
+        isinstance(raw_start_loop, bool)
+        or not isinstance(raw_start_loop, int)
+        or raw_start_loop < 1
+    ):
+        raise IssueLedgerError(
+            "issue ledger application correlation boundary must be a positive integer"
+        )
+    if not applications:
+        raise IssueLedgerError(
+            "issue ledger application correlation boundary has no application"
+        )
+    if applications[0]["loop"] < raw_start_loop:
+        raise IssueLedgerError(
+            "issue ledger application precedes its correlation boundary"
+        )
+    return raw_start_loop
+
+
 def _validated_history(
     history: list[object],
     current_status: str,
-    applications_by_loop: Mapping[object, Mapping[str, object]] | None,
+    applications_by_loop: Mapping[object, Mapping[str, object]],
+    correlation_start_loop: int | None,
 ) -> list[int]:
     if not history:
         raise IssueLedgerError("issue history must not be empty")
@@ -336,10 +396,15 @@ def _validated_history(
         candidate = event.get("candidate")
         if not _is_candidate_sha(candidate):
             raise IssueLedgerError("issue history candidate SHA is invalid")
-        if applications_by_loop is not None:
+        if (
+            correlation_start_loop is not None
+            and loop_index >= correlation_start_loop
+        ):
             application = applications_by_loop.get(loop_index)
             if application is None:
-                raise IssueLedgerError("issue history loop has no application")
+                raise IssueLedgerError(
+                    f"issue history loop {loop_index} has no application"
+                )
             if application.get("candidate") != candidate:
                 raise IssueLedgerError(
                     "issue history candidate does not match its application"

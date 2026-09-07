@@ -55,6 +55,39 @@ def gap(claim_id: str, severity: str = "major") -> dict[str, object]:
     }
 
 
+def write_legacy_open_issue(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "issues": [
+                    {
+                        "claim_id": "player-moves",
+                        "status": "open",
+                        "severity": "major",
+                        "impact": "player-moves is unavailable",
+                        "recommended_update": "implement player-moves",
+                        "validation_requirement": "recheck player-moves",
+                        "history": [
+                            {
+                                "loop": 1,
+                                "candidate": "a" * 40,
+                                "evidence_path": None,
+                                "observation": "could not verify player-moves",
+                                "status": "open",
+                            }
+                        ],
+                    }
+                ],
+                "summary": {"total": 1, "open": 1, "closed": 0, "regressed": 0},
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_verified_claim_that_later_gaps_becomes_regressed(tmp_path: Path) -> None:
     """Treating a reopened verified issue as merely open must make this fail."""
     ledger = IssueLedger(tmp_path / "issue-ledger.json")
@@ -443,3 +476,215 @@ def test_older_loop_after_newer_application_is_rejected(tmp_path: Path) -> None:
     issue = ledger.load()["issues"][0]
     assert issue["status"] == "open"
     assert [event["loop"] for event in issue["history"]] == [2]
+
+
+def test_legacy_history_migration_boundary_supports_replay_and_future_loops(
+    tmp_path: Path,
+) -> None:
+    """Requiring applications for pre-migration history must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    write_legacy_open_issue(path)
+    ledger = IssueLedger(path)
+    loop_2 = evidence(
+        "b" * 40,
+        verified_records=[verified("player-moves", "checks/pass-2.log")],
+    )
+
+    ledger.apply(loop_2, 2)
+    first_write = path.read_bytes()
+    ledger.apply(loop_2, 2)
+
+    migrated = ledger.load()
+    assert path.read_bytes() == first_write
+    assert migrated["schema_version"] == 2
+    assert migrated["application_correlation_start_loop"] == 2
+    assert [application["loop"] for application in migrated["applications"]] == [2]
+    assert [event["loop"] for event in migrated["issues"][0]["history"]] == [1, 2]
+
+    loop_3 = evidence("c" * 40, gap_records=[gap("player-moves")])
+    ledger.apply(loop_3, 3)
+    second_write = path.read_bytes()
+    ledger.apply(loop_3, 3)
+
+    advanced = ledger.load()
+    assert path.read_bytes() == second_write
+    assert [application["loop"] for application in advanced["applications"]] == [2, 3]
+    assert [event["loop"] for event in advanced["issues"][0]["history"]] == [1, 2, 3]
+    assert advanced["issues"][0]["status"] == "regressed"
+
+
+def test_migrated_ledger_rejects_missing_correlated_applications_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Disabling correlation when applications are removed must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    write_legacy_open_issue(path)
+    ledger = IssueLedger(path)
+    ledger.apply(
+        evidence("b" * 40, verified_records=[verified("player-moves")]),
+        2,
+    )
+    document = ledger.load()
+    document["schema_version"] = 2
+    document["application_correlation_start_loop"] = 2
+    document["applications"] = []
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="application"):
+        ledger.apply(evidence("c" * 40, gap_records=[gap("player-moves")]), 3)
+
+    assert path.read_bytes() == tampered
+
+
+def test_migrated_ledger_rejects_missing_future_application_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Blaming pre-migration history instead of a later missing application must fail."""
+    path = tmp_path / "issue-ledger.json"
+    write_legacy_open_issue(path)
+    ledger = IssueLedger(path)
+    ledger.apply(
+        evidence("b" * 40, verified_records=[verified("player-moves")]),
+        2,
+    )
+    document = ledger.load()
+    document["schema_version"] = 2
+    document["application_correlation_start_loop"] = 2
+    issue = document["issues"][0]
+    issue["status"] = "regressed"
+    issue["history"].append(
+        {
+            "loop": 3,
+            "candidate": "c" * 40,
+            "evidence_path": None,
+            "observation": "could not verify player-moves",
+            "status": "regressed",
+        }
+    )
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="loop 3 has no application"):
+        ledger.apply(evidence("d" * 40, gap_records=[gap("player-moves")]), 4)
+
+    assert path.read_bytes() == tampered
+
+
+def test_migrated_ledger_rejects_malformed_boundary_application_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Correlating legacy history instead of the boundary event must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    write_legacy_open_issue(path)
+    ledger = IssueLedger(path)
+    ledger.apply(
+        evidence("b" * 40, verified_records=[verified("player-moves")]),
+        2,
+    )
+    document = ledger.load()
+    document["schema_version"] = 2
+    document["application_correlation_start_loop"] = 2
+    document["applications"][0]["candidate"] = "d" * 40
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(
+        IssueLedgerError, match="history candidate does not match its application"
+    ):
+        ledger.apply(evidence("c" * 40, gap_records=[gap("player-moves")]), 3)
+
+    assert path.read_bytes() == tampered
+
+
+def test_native_ledger_requires_applications_for_all_native_history(
+    tmp_path: Path,
+) -> None:
+    """Treating native history without applications as legacy must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    ledger.apply(evidence("a" * 40, gap_records=[gap("player-moves")]), 1)
+    document = ledger.load()
+    document["schema_version"] = 2
+    document["application_correlation_start_loop"] = 1
+    document["applications"] = []
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="application"):
+        ledger.apply(
+            evidence("b" * 40, verified_records=[verified("player-moves")]),
+            2,
+        )
+
+    assert path.read_bytes() == tampered
+
+
+def test_native_ledger_starting_at_later_loop_does_not_create_legacy_history(
+    tmp_path: Path,
+) -> None:
+    """Using the first application as every native boundary must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    loop_2 = evidence("a" * 40, gap_records=[gap("player-moves")])
+    ledger.apply(loop_2, 2)
+    document = ledger.load()
+    document["issues"][0]["history"].insert(
+        0,
+        {
+            "loop": 1,
+            "candidate": "b" * 40,
+            "evidence_path": None,
+            "observation": "could not verify player-moves",
+            "status": "open",
+        },
+    )
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="loop 1 has no application"):
+        ledger.apply(loop_2, 2)
+
+    assert path.read_bytes() == tampered
+
+
+def test_native_schema_requires_explicit_application_correlation_boundary(
+    tmp_path: Path,
+) -> None:
+    """Accepting a native ledger without its boundary must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    ledger.apply(evidence("a" * 40, gap_records=[gap("player-moves")]), 1)
+    document = ledger.load()
+    document["schema_version"] = 2
+    document.pop("application_correlation_start_loop", None)
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="correlation boundary"):
+        ledger.apply(
+            evidence("b" * 40, verified_records=[verified("player-moves")]),
+            2,
+        )
+
+    assert path.read_bytes() == tampered
+
+
+@pytest.mark.parametrize("schema_version", [True, 2.0])
+def test_application_correlation_schema_version_must_be_an_integer(
+    tmp_path: Path, schema_version: object
+) -> None:
+    """Letting bools or floats select boundary semantics must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    replayed = evidence("a" * 40, gap_records=[gap("player-moves")])
+    ledger.apply(replayed, 1)
+    document = ledger.load()
+    document["schema_version"] = schema_version
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="schema_version"):
+        ledger.apply(replayed, 1)
+
+    assert path.read_bytes() == tampered
