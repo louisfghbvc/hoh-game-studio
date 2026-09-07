@@ -88,6 +88,14 @@ def write_legacy_open_issue(path: Path) -> None:
     )
 
 
+def downgrade_native_ledger_to_schema_v1(path: Path) -> None:
+    """Model the persisted shape emitted before correlation metadata existed."""
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["schema_version"] = 1
+    document.pop("application_correlation_start_loop", None)
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
 def test_verified_claim_that_later_gaps_becomes_regressed(tmp_path: Path) -> None:
     """Treating a reopened verified issue as merely open must make this fail."""
     ledger = IssueLedger(tmp_path / "issue-ledger.json")
@@ -646,6 +654,72 @@ def test_native_ledger_starting_at_later_loop_does_not_create_legacy_history(
         ledger.apply(loop_2, 2)
 
     assert path.read_bytes() == tampered
+
+
+@pytest.mark.parametrize(
+    "persisted_boundary",
+    [MISSING, 2],
+    ids=["inferred-first-application", "legacy-explicit-boundary"],
+)
+def test_schema_v1_application_state_rejects_uncorrelated_prefix_without_writing(
+    tmp_path: Path, persisted_boundary: object
+) -> None:
+    """Treating an unauthenticated v1 prefix as migrated history must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    replayed = evidence("a" * 40, gap_records=[gap("player-moves")])
+    ledger.apply(replayed, 2)
+    downgrade_native_ledger_to_schema_v1(path)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if persisted_boundary is not MISSING:
+        document["application_correlation_start_loop"] = persisted_boundary
+    document["issues"][0]["history"].insert(
+        0,
+        {
+            "loop": 1,
+            "candidate": "b" * 40,
+            "evidence_path": None,
+            "observation": "could not verify player-moves",
+            "status": "open",
+        },
+    )
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="loop 1 has no application"):
+        ledger.apply(replayed, 2)
+
+    assert path.read_bytes() == tampered
+
+
+def test_fully_correlated_schema_v1_starting_at_loop_2_upgrades_from_loop_1(
+    tmp_path: Path,
+) -> None:
+    """Inferring loop 2 for fully correlated v1 state must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    loop_2 = evidence("a" * 40, gap_records=[gap("player-moves")])
+    ledger.apply(loop_2, 2)
+    downgrade_native_ledger_to_schema_v1(path)
+    pre_upgrade = path.read_bytes()
+
+    ledger.apply(loop_2, 2)
+
+    assert path.read_bytes() == pre_upgrade
+
+    ledger.apply(
+        evidence("b" * 40, verified_records=[verified("player-moves")]),
+        3,
+    )
+
+    upgraded = ledger.load()
+    assert upgraded["schema_version"] == 2
+    assert upgraded["application_correlation_start_loop"] == 1
+    assert [application["loop"] for application in upgraded["applications"]] == [
+        2,
+        3,
+    ]
+    assert [event["loop"] for event in upgraded["issues"][0]["history"]] == [2, 3]
 
 
 def test_native_schema_requires_explicit_application_correlation_boundary(

@@ -338,24 +338,27 @@ def _validated_correlation_start_loop(
         raise IssueLedgerError("issue ledger schema_version is invalid")
 
     raw_start_loop = document.get(_CORRELATION_START_FIELD, _MISSING)
-    if raw_start_loop is _MISSING:
-        if schema_version == _CURRENT_SCHEMA_VERSION:
-            raise IssueLedgerError(
-                "issue ledger application correlation boundary is missing"
-            )
-        if not applications:
-            return None
-        start_loop = applications[0]["loop"]
-        assert isinstance(start_loop, int)
-        return start_loop
-
-    if (
+    if raw_start_loop is not _MISSING and (
         isinstance(raw_start_loop, bool)
         or not isinstance(raw_start_loop, int)
         or raw_start_loop < 1
     ):
         raise IssueLedgerError(
             "issue ledger application correlation boundary must be a positive integer"
+        )
+
+    if schema_version == _LEGACY_SCHEMA_VERSION:
+        if applications:
+            # A v1 document cannot authenticate history before its first application.
+            # Requiring correlation from loop 1 accepts fully correlated native state
+            # while rejecting an ambiguous or injected pre-application prefix.
+            return 1
+        if raw_start_loop is _MISSING:
+            return None
+
+    if raw_start_loop is _MISSING:
+        raise IssueLedgerError(
+            "issue ledger application correlation boundary is missing"
         )
     if not applications:
         raise IssueLedgerError(
