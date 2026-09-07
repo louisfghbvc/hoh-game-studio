@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -231,6 +232,45 @@ def test_exact_evidence_replay_is_idempotent_and_uses_canonical_identity(
     assert application["loop"] == 1
     assert application["candidate"] == "a" * 40
     assert len(application["evidence_sha256"]) == 64
+
+
+def test_exact_replay_rejects_duplicate_persisted_claim_ids_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Returning before duplicate issue validation must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    replayed = evidence("a" * 40, gap_records=[gap("player-moves")])
+    ledger.apply(replayed, 1)
+    document = ledger.load()
+    document["issues"].append(deepcopy(document["issues"][0]))
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="duplicate issue claim_id"):
+        ledger.apply(replayed, 1)
+
+    assert path.read_bytes() == tampered
+
+
+@pytest.mark.parametrize("malformed_history", ["not-a-list", [{"loop": 0}]])
+def test_exact_replay_rejects_malformed_persisted_history_without_writing(
+    tmp_path: Path, malformed_history: object
+) -> None:
+    """Returning before complete history validation must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    replayed = evidence("a" * 40, gap_records=[gap("player-moves")])
+    ledger.apply(replayed, 1)
+    document = ledger.load()
+    document["issues"][0]["history"] = malformed_history
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="history"):
+        ledger.apply(replayed, 1)
+
+    assert path.read_bytes() == tampered
 
 
 @pytest.mark.parametrize("conflict", ["candidate", "evidence"])

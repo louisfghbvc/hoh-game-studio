@@ -58,6 +58,21 @@ class IssueLedger:
         assert isinstance(raw_issues, list)
         applications = document["applications"]
         assert isinstance(applications, list)
+        issues: dict[str, dict[str, object]] = {}
+        for issue in raw_issues:
+            if not isinstance(issue, dict):
+                raise IssueLedgerError("issue entries must be objects")
+            claim_id = issue.get("claim_id")
+            if not isinstance(claim_id, str) or not claim_id:
+                raise IssueLedgerError("issue claim_id must be non-empty")
+            if claim_id in issues:
+                raise IssueLedgerError(f"duplicate issue claim_id: {claim_id}")
+            history = issue.get("history")
+            if not isinstance(history, list):
+                raise IssueLedgerError(f"issue history must be a list: {claim_id}")
+            issues[claim_id] = deepcopy(issue)
+        history_loop_indices = _history_loop_indices(raw_issues)
+
         replay = next(
             (application for application in applications if application["loop"] == loop_index),
             None,
@@ -74,7 +89,7 @@ class IssueLedger:
 
         latest_loop = max(
             [application["loop"] for application in applications]
-            + _history_loop_indices(raw_issues),
+            + history_loop_indices,
             default=0,
         )
         if loop_index == latest_loop:
@@ -85,20 +100,6 @@ class IssueLedger:
             raise IssueLedgerError(
                 f"loop {loop_index} is out of order after loop {latest_loop}"
             )
-
-        issues: dict[str, dict[str, object]] = {}
-        for issue in raw_issues:
-            if not isinstance(issue, dict):
-                raise IssueLedgerError("issue entries must be objects")
-            claim_id = issue.get("claim_id")
-            if not isinstance(claim_id, str) or not claim_id:
-                raise IssueLedgerError("issue claim_id must be non-empty")
-            if claim_id in issues:
-                raise IssueLedgerError(f"duplicate issue claim_id: {claim_id}")
-            history = issue.get("history")
-            if not isinstance(history, list):
-                raise IssueLedgerError(f"issue history must be a list: {claim_id}")
-            issues[claim_id] = deepcopy(issue)
 
         for gap in _evidence_records(evidence, "gap_records"):
             claim_id = _record_claim_id(gap)
