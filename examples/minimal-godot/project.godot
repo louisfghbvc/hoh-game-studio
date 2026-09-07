@@ -1,0 +1,13 @@
+; Minimal deterministic Godot adapter fixture.
+config_version=5
+
+[application]
+config/name="Minimal Godot"
+run/main_scene="res://main.tscn"
+
+[display]
+window/size/viewport_width=320
+window/size/viewport_height=180
+
+[rendering]
+renderer/rendering_method="gl_compatibility"
