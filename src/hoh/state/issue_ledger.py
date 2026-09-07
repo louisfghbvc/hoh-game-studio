@@ -11,6 +11,20 @@ from pathlib import Path
 from hoh.state.store import atomic_write_json
 
 
+_ISSUE_STATUSES = frozenset({"open", "closed", "regressed"})
+_GAP_SEVERITIES = frozenset({"blocker", "major", "minor"})
+_ISSUE_TEXT_FIELDS = ("impact", "recommended_update", "validation_requirement")
+_HISTORY_FIELDS = frozenset(
+    {"loop", "candidate", "evidence_path", "observation", "status"}
+)
+_STATUS_TRANSITIONS = {
+    None: frozenset({"open"}),
+    "open": frozenset({"open", "closed"}),
+    "closed": frozenset({"closed", "regressed"}),
+    "regressed": frozenset({"regressed", "closed"}),
+}
+
+
 class IssueLedgerError(ValueError):
     """Raised when persisted issue state is malformed."""
 
@@ -58,7 +72,11 @@ class IssueLedger:
         assert isinstance(raw_issues, list)
         applications = document["applications"]
         assert isinstance(applications, list)
+        applications_by_loop = {
+            application["loop"]: application for application in applications
+        }
         issues: dict[str, dict[str, object]] = {}
+        history_loop_indices: list[int] = []
         for issue in raw_issues:
             if not isinstance(issue, dict):
                 raise IssueLedgerError("issue entries must be objects")
@@ -70,8 +88,24 @@ class IssueLedger:
             history = issue.get("history")
             if not isinstance(history, list):
                 raise IssueLedgerError(f"issue history must be a list: {claim_id}")
+            status = issue.get("status")
+            severity = issue.get("severity")
+            if status not in _ISSUE_STATUSES:
+                raise IssueLedgerError(f"issue status is invalid: {claim_id}")
+            if severity not in _GAP_SEVERITIES:
+                raise IssueLedgerError(f"issue severity is invalid: {claim_id}")
+            for field in _ISSUE_TEXT_FIELDS:
+                value = issue.get(field)
+                if not isinstance(value, str) or not value:
+                    raise IssueLedgerError(f"issue {field} must be non-empty: {claim_id}")
+            history_loop_indices.extend(
+                _validated_history(
+                    history,
+                    str(status),
+                    applications_by_loop if applications else None,
+                )
+            )
             issues[claim_id] = deepcopy(issue)
-        history_loop_indices = _history_loop_indices(raw_issues)
 
         replay = next(
             (application for application in applications if application["loop"] == loop_index),
@@ -225,7 +259,7 @@ def _derived_summary(issues: list[object]) -> dict[str, int]:
         if not isinstance(issue, Mapping):
             raise IssueLedgerError("issue entries must be objects")
         status = issue.get("status")
-        if status not in {"open", "closed", "regressed"}:
+        if status not in _ISSUE_STATUSES:
             raise IssueLedgerError(f"unknown issue status: {status}")
         counts[str(status)] += 1
     return counts
@@ -262,8 +296,8 @@ def _validated_applications(raw: object) -> list[dict[str, object]]:
             or loop_index <= previous_loop
         ):
             raise IssueLedgerError("issue ledger application loops must strictly increase")
-        if not isinstance(candidate, str) or not candidate:
-            raise IssueLedgerError("issue ledger application candidate must be non-empty")
+        if not _is_candidate_sha(candidate):
+            raise IssueLedgerError("issue ledger application candidate SHA is invalid")
         if (
             not isinstance(evidence_sha256, str)
             or len(evidence_sha256) != 64
@@ -275,23 +309,68 @@ def _validated_applications(raw: object) -> list[dict[str, object]]:
     return applications
 
 
-def _history_loop_indices(issues: list[object]) -> list[int]:
+def _validated_history(
+    history: list[object],
+    current_status: str,
+    applications_by_loop: Mapping[object, Mapping[str, object]] | None,
+) -> list[int]:
+    if not history:
+        raise IssueLedgerError("issue history must not be empty")
     loop_indices: list[int] = []
-    for issue in issues:
-        if not isinstance(issue, Mapping):
-            raise IssueLedgerError("issue entries must be objects")
-        history = issue.get("history")
-        if not isinstance(history, list):
-            raise IssueLedgerError("issue history must be a list")
-        for event in history:
-            if not isinstance(event, Mapping):
-                raise IssueLedgerError("issue history event must be an object")
-            loop_index = event.get("loop")
-            if (
-                isinstance(loop_index, bool)
-                or not isinstance(loop_index, int)
-                or loop_index < 1
-            ):
-                raise IssueLedgerError("issue history loop must be a positive integer")
-            loop_indices.append(loop_index)
+    previous_loop = 0
+    previous_status: str | None = None
+    for event in history:
+        if not isinstance(event, Mapping):
+            raise IssueLedgerError("issue history event must be an object")
+        if set(event) != _HISTORY_FIELDS:
+            raise IssueLedgerError("issue history event fields are invalid")
+        loop_index = event.get("loop")
+        if (
+            isinstance(loop_index, bool)
+            or not isinstance(loop_index, int)
+            or loop_index <= previous_loop
+        ):
+            raise IssueLedgerError(
+                "issue history loops must be positive and strictly increasing"
+            )
+        candidate = event.get("candidate")
+        if not _is_candidate_sha(candidate):
+            raise IssueLedgerError("issue history candidate SHA is invalid")
+        if applications_by_loop is not None:
+            application = applications_by_loop.get(loop_index)
+            if application is None:
+                raise IssueLedgerError("issue history loop has no application")
+            if application.get("candidate") != candidate:
+                raise IssueLedgerError(
+                    "issue history candidate does not match its application"
+                )
+        status = event.get("status")
+        if status not in _ISSUE_STATUSES:
+            raise IssueLedgerError("issue history status is invalid")
+        if status not in _STATUS_TRANSITIONS[previous_status]:
+            raise IssueLedgerError("issue history status transition is invalid")
+        evidence_path = event.get("evidence_path")
+        if status == "closed":
+            if not isinstance(evidence_path, str) or not evidence_path:
+                raise IssueLedgerError(
+                    "issue history evidence_path must identify closed evidence"
+                )
+        elif evidence_path is not None:
+            raise IssueLedgerError("issue history evidence_path must be null for a gap")
+        observation = event.get("observation")
+        if not isinstance(observation, str) or not observation:
+            raise IssueLedgerError("issue history observation must be non-empty")
+        loop_indices.append(loop_index)
+        previous_loop = loop_index
+        previous_status = str(status)
+    if previous_status != current_status:
+        raise IssueLedgerError("issue status does not match final history status")
     return loop_indices
+
+
+def _is_candidate_sha(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 40 <= len(value) <= 64
+        and all(character in "0123456789abcdef" for character in value)
+    )

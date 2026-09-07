@@ -9,6 +9,9 @@ import pytest
 from hoh.state.issue_ledger import IssueLedger, IssueLedgerError
 
 
+MISSING = object()
+
+
 def evidence(
     candidate: str,
     *,
@@ -268,6 +271,142 @@ def test_exact_replay_rejects_malformed_persisted_history_without_writing(
     tampered = path.read_bytes()
 
     with pytest.raises(IssueLedgerError, match="history"):
+        ledger.apply(replayed, 1)
+
+    assert path.read_bytes() == tampered
+
+
+@pytest.mark.parametrize(
+    ("field", "corrupt_value"),
+    [
+        ("candidate", MISSING),
+        ("candidate", "not-a-sha"),
+        ("candidate", "b" * 40),
+        ("loop", 2),
+        ("evidence_path", MISSING),
+        ("evidence_path", "unexpected-for-gap.log"),
+        ("observation", MISSING),
+        ("observation", 7),
+        ("status", MISSING),
+        ("status", "unknown"),
+    ],
+    ids=[
+        "missing-candidate",
+        "corrupt-candidate",
+        "candidate-does-not-match-application",
+        "loop-has-no-application",
+        "missing-evidence-path",
+        "gap-path-not-null",
+        "missing-observation",
+        "corrupt-observation",
+        "missing-status",
+        "corrupt-status",
+    ],
+)
+def test_exact_replay_rejects_missing_or_corrupt_history_provenance_without_writing(
+    tmp_path: Path, field: str, corrupt_value: object
+) -> None:
+    """Accepting incomplete persisted provenance before replay must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    replayed = evidence("a" * 40, gap_records=[gap("player-moves")])
+    ledger.apply(replayed, 1)
+    document = ledger.load()
+    event = document["issues"][0]["history"][0]
+    if corrupt_value is MISSING:
+        event.pop(field)
+    else:
+        event[field] = corrupt_value
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="history"):
+        ledger.apply(replayed, 1)
+
+    assert path.read_bytes() == tampered
+
+
+def test_exact_replay_rejects_closed_history_without_evidence_path(
+    tmp_path: Path,
+) -> None:
+    """Allowing a closed event without verification provenance must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    ledger.apply(evidence("a" * 40, gap_records=[gap("player-moves")]), 1)
+    replayed = evidence("b" * 40, verified_records=[verified("player-moves")])
+    ledger.apply(replayed, 2)
+    document = ledger.load()
+    document["issues"][0]["history"][-1]["evidence_path"] = None
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="history evidence_path"):
+        ledger.apply(replayed, 2)
+
+    assert path.read_bytes() == tampered
+
+
+def test_exact_replay_rejects_invalid_persisted_status_transition_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Accepting a lifecycle that starts closed must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    replayed = evidence("a" * 40, gap_records=[gap("player-moves")])
+    ledger.apply(replayed, 1)
+    document = ledger.load()
+    issue = document["issues"][0]
+    issue["status"] = "closed"
+    issue["history"][0]["status"] = "closed"
+    issue["history"][0]["evidence_path"] = "checks/forged.log"
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="history status transition"):
+        ledger.apply(replayed, 1)
+
+    assert path.read_bytes() == tampered
+
+
+@pytest.mark.parametrize(
+    ("field", "corrupt_value"),
+    [
+        ("severity", MISSING),
+        ("severity", "critical"),
+        ("impact", 7),
+        ("recommended_update", MISSING),
+        ("validation_requirement", ""),
+        ("status", "closed"),
+        ("history", []),
+    ],
+    ids=[
+        "missing-severity",
+        "corrupt-severity",
+        "corrupt-impact",
+        "missing-recommended-update",
+        "empty-validation-requirement",
+        "status-does-not-match-history",
+        "empty-history",
+    ],
+)
+def test_exact_replay_rejects_malformed_current_issue_fields_without_writing(
+    tmp_path: Path, field: str, corrupt_value: object
+) -> None:
+    """Returning before current issue validation must make this fail."""
+    path = tmp_path / "issue-ledger.json"
+    ledger = IssueLedger(path)
+    replayed = evidence("a" * 40, gap_records=[gap("player-moves")])
+    ledger.apply(replayed, 1)
+    document = ledger.load()
+    issue = document["issues"][0]
+    if corrupt_value is MISSING:
+        issue.pop(field)
+    else:
+        issue[field] = corrupt_value
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="issue"):
         ledger.apply(replayed, 1)
 
     assert path.read_bytes() == tampered
