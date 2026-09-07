@@ -91,6 +91,19 @@ def test_status_is_derived_from_receipts_and_ledger_in_stable_order() -> None:
     state = report_fixture()
     state["total_tokens"] = 99_999
     state["best_candidate"] = "a" * 40
+    state["current_candidate"] = "a" * 40
+    state["loops"] = [
+        {
+            "normalized_evidence": {
+                "candidate_sha": "a" * 40,
+                "product_complete": True,
+                "verified_records": [
+                    {"claim_id": "zebra"},
+                    {"claim_id": "alpha"},
+                ],
+            },
+        }
+    ]
     status = build_status(
         state,
         receipts=receipts(),
@@ -209,3 +222,70 @@ def test_complete_with_short_best_candidate_requires_manual_action() -> None:
 
     assert status["guidance"].startswith("Manual action required:")
     assert "git merge" not in status["guidance"]
+
+
+def test_complete_with_canonical_unbound_best_candidate_requires_manual_action() -> None:
+    state = report_fixture()
+    state["best_candidate"] = "a" * 40
+    state["current_candidate"] = "b" * 40
+    state["loops"] = [
+        {
+            "normalized_evidence": {
+                "candidate_sha": "b" * 40,
+                "product_complete": True,
+            }
+        }
+    ]
+
+    status = build_status(
+        state,
+        decision=StopDecision(True, "complete", "all required claims verified"),
+    )
+
+    assert status["guidance"].startswith("Manual action required:")
+    assert "git merge" not in status["guidance"]
+    assert "hoh resume" not in status["guidance"]
+
+
+def test_complete_requires_best_current_and_evidence_candidates_to_match() -> None:
+    state = report_fixture()
+    state["best_candidate"] = "a" * 40
+    state["current_candidate"] = "b" * 40
+    state["loops"] = [
+        {
+            "normalized_evidence": {
+                "candidate_sha": "a" * 40,
+                "product_complete": True,
+            }
+        }
+    ]
+
+    status = build_status(
+        state,
+        decision=StopDecision(True, "complete", "all required claims verified"),
+    )
+
+    assert status["guidance"].startswith("Manual action required:")
+
+
+def test_complete_with_noncanonical_best_candidate_requires_manual_action() -> None:
+    for best_candidate in ("g" * 40, "a" * 39 + ";", "a" * 39 + "\r"):
+        state = report_fixture()
+        state["best_candidate"] = best_candidate
+        state["current_candidate"] = "b" * 40
+        state["loops"] = [
+            {
+                "normalized_evidence": {
+                    "candidate_sha": "b" * 40,
+                    "product_complete": True,
+                }
+            }
+        ]
+
+        status = build_status(
+            state,
+            decision=StopDecision(True, "complete", "all required claims verified"),
+        )
+
+        assert status["guidance"].startswith("Manual action required:")
+        assert "git merge" not in status["guidance"]

@@ -47,9 +47,14 @@ def build_status(
     run_id = _text(run_state.get("run_id"))
     current_candidate = _candidate(run_state, "current_candidate")
     best_candidate = _candidate(run_state, "best_candidate")
+    completed_candidate = _completion_bound_current_candidate(loops, current_candidate)
     if terminal_status == "complete" and best_candidate is None:
-        best_candidate = _completion_bound_current_candidate(loops, current_candidate)
-    merge_candidate = best_candidate if _valid_git_sha(best_candidate) else None
+        best_candidate = completed_candidate
+    merge_candidate = (
+        best_candidate
+        if terminal_status == "complete" and best_candidate == completed_candidate
+        else None
+    )
     terminal_failure_category = _failure_category(_text(resolved_decision["reason"]))
 
     status: dict[str, object] = {
