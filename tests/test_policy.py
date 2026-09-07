@@ -36,6 +36,7 @@ def loop(
     agent_completed: bool = False,
 ) -> dict[str, object]:
     candidate_sha = "a" * 40
+    qa_invocation_id = "loop-qa-1"
     return {
         "normalized_evidence": {
             "candidate_sha": candidate_sha,
@@ -55,6 +56,7 @@ def loop(
         },
         "deterministic_checks_passed": True,
         "deterministic_checks_candidate_sha": candidate_sha,
+        "qa_invocation_id": qa_invocation_id,
         "issues": [],
         "issues_candidate_sha": candidate_sha,
         "issue_summary": issue_summary
@@ -64,8 +66,14 @@ def loop(
             "open_blocker": 0,
             "open_major": 0,
         },
-        "release_gate_passed": True,
-        "release_gate_candidate_sha": candidate_sha,
+        "release_gate": {
+            "invocation_id": "release-qa-1",
+            "scope": "full_release",
+            "qa_status": "pass",
+            "end_to_end_passed": True,
+            "deterministic_checks_passed": True,
+            "candidate_sha": candidate_sha,
+        },
         "acceptance_claim_ids": sorted(acceptance_claim_ids),
         "agent_completed": agent_completed,
     }
@@ -201,7 +209,7 @@ def test_completion_requires_passing_qa_status() -> None:
 
 def test_completion_requires_a_fresh_host_release_gate() -> None:
     history = complete_history_at_loop_12()
-    history[-1]["release_gate_passed"] = False
+    history[-1]["release_gate"] = {}
 
     assert policy().evaluate(history).terminal_status != "complete"
 
@@ -222,7 +230,7 @@ def test_explicit_empty_latest_evidence_cannot_borrow_history_state() -> None:
 
 def test_completion_rejects_a_release_gate_for_another_candidate() -> None:
     history = complete_history_at_loop_12()
-    history[-1]["release_gate_candidate_sha"] = "b" * 40
+    history[-1]["release_gate"]["candidate_sha"] = "b" * 40  # type: ignore[index]
 
     assert policy().evaluate(history).terminal_status != "complete"
 
@@ -242,3 +250,95 @@ def test_aggregate_closed_issue_counts_do_not_create_progress() -> None:
     assert policy().evaluate(history) == StopDecision(
         True, "blocked", "no measurable evidence progress for 3 consecutive loops"
     )
+
+
+def test_completion_rejects_a_release_gate_using_the_loop_qa_invocation() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["release_gate"]["invocation_id"] = "loop-qa-1"  # type: ignore[index]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_requires_release_e2e_success() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["release_gate"].pop("end_to_end_passed")  # type: ignore[index]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def valid_closed_issue(claim_id: str) -> dict[str, object]:
+    return {
+        "claim_id": claim_id,
+        "status": "closed",
+        "severity": "minor",
+        "impact": "Player-visible save state.",
+        "recommended_update": "Keep the verified behavior.",
+        "validation_requirement": "Run the save check.",
+        "history": [
+            {
+                "loop": 1,
+                "candidate": "b" * 40,
+                "evidence_path": None,
+                "observation": "save behavior needs verification",
+                "status": "open",
+            },
+            {
+                "loop": 2,
+                "candidate": "b" * 40,
+                "evidence_path": "checks/save.log",
+                "observation": "save behavior passed",
+                "status": "closed",
+            }
+        ],
+    }
+
+
+def test_completion_rejects_issue_without_auditable_history() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["issues"] = [
+        {"claim_id": "save", "status": "closed", "severity": "minor"}
+    ]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_rejects_duplicate_authoritative_issue_ids() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["issues"] = [valid_closed_issue("save"), valid_closed_issue("save")]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_requires_an_explicit_check_candidate_sha() -> None:
+    history = complete_history_at_loop_12()
+    history[-1].pop("deterministic_checks_candidate_sha")
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_requires_an_explicit_issue_candidate_sha() -> None:
+    history = complete_history_at_loop_12()
+    history[-1].pop("issues_candidate_sha")
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_rejects_a_mismatched_check_candidate_sha() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["deterministic_checks_candidate_sha"] = "b" * 40
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_rejects_a_mismatched_issue_candidate_sha() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["issues_candidate_sha"] = "b" * 40
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_accepts_a_strictly_valid_closed_issue() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["issues"] = [valid_closed_issue("save")]
+
+    assert policy().evaluate(history).terminal_status == "complete"

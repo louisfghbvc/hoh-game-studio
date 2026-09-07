@@ -8,6 +8,22 @@ from dataclasses import dataclass
 from hoh.models import HarnessConfig
 
 
+_ISSUE_STATUSES = frozenset({"open", "closed", "regressed"})
+_GAP_SEVERITIES = frozenset({"blocker", "major", "minor"})
+_ISSUE_TEXT_FIELDS = ("impact", "recommended_update", "validation_requirement")
+_ISSUE_FIELDS = frozenset({"claim_id", "status", "severity", "history", *_ISSUE_TEXT_FIELDS})
+_HISTORY_FIELDS = frozenset(
+    {"loop", "candidate", "evidence_path", "observation", "status"}
+)
+_STATUS_TRANSITIONS = {
+    None: frozenset({"open"}),
+    "open": frozenset({"open", "closed"}),
+    "closed": frozenset({"closed", "regressed"}),
+    "regressed": frozenset({"regressed", "closed"}),
+}
+_MISSING = object()
+
+
 @dataclass(frozen=True)
 class ProgressSnapshot:
     """Evidence-derived progress at the end of a loop history."""
@@ -86,8 +102,8 @@ class StopPolicy:
         deterministic_checks_candidate_sha: str | None = None,
         issue_summary: Mapping[str, object] | None = None,
         issue_state_candidate_sha: str | None = None,
-        release_gate_passed: bool | None = None,
-        release_gate_candidate_sha: str | None = None,
+        qa_invocation_id: str | None = None,
+        release_gate: Mapping[str, object] | None = None,
         elapsed_seconds: int = 0,
         total_tokens: int = 0,
         cancelled: bool = False,
@@ -97,11 +113,14 @@ class StopPolicy:
 
         Task 13 should normally pass a completed loop record in ``history``.  Its
         latest record must contain normalized evidence with ``candidate_sha`` and
-        ``qa_status``, check and issue-state candidate SHAs, authoritative issue
-        entries (or a severity-complete summary), and a fresh release-gate result
-        with its candidate SHA.  When passing ``latest_evidence`` directly, pass
-        the matching candidate-bound check, issue-summary, and release-gate
-        arguments as well; completion otherwise fails closed.
+        ``qa_status``, the ordinary ``qa_invocation_id``, check and issue-state
+        candidate SHAs, authoritative issue entries (or a severity-complete
+        summary), and a ``release_gate`` record. The gate record must identify a
+        different invocation, the same candidate, ``full_release`` scope or kind,
+        QA pass, end-to-end pass, and deterministic-check pass. When passing
+        ``latest_evidence`` directly, pass the matching candidate-bound check,
+        issue-summary, QA invocation ID, and release gate arguments as well;
+        completion otherwise fails closed.
         """
 
         latest_loop = history[-1] if latest_evidence is None and history else {}
@@ -122,19 +141,17 @@ class StopPolicy:
         issue_candidate = (
             issue_state_candidate_sha
             if issue_state_candidate_sha is not None
-            else latest_loop.get(
-                "issues_candidate_sha", summary.get("candidate_sha")
-            )
+            else latest_loop.get("issues_candidate_sha")
         )
-        release_passed = (
-            release_gate_passed
-            if release_gate_passed is not None
-            else latest_loop.get("release_gate_passed")
+        qa_invocation = (
+            qa_invocation_id
+            if qa_invocation_id is not None
+            else latest_loop.get("qa_invocation_id")
         )
-        release_candidate = (
-            release_gate_candidate_sha
-            if release_gate_candidate_sha is not None
-            else latest_loop.get("release_gate_candidate_sha")
+        gate = (
+            release_gate
+            if release_gate is not None
+            else _mapping(latest_loop.get("release_gate"))
         )
 
         if _is_verified_completion(
@@ -144,8 +161,8 @@ class StopPolicy:
             summary,
             issue_candidate,
             latest_loop,
-            release_passed,
-            release_candidate,
+            qa_invocation,
+            gate,
         ):
             return StopDecision(True, "complete", "all required claims verified")
         if cancelled:
@@ -290,8 +307,8 @@ def _is_verified_completion(
     issue_summary: Mapping[str, object],
     issue_state_candidate_sha: object,
     latest_loop: Mapping[str, object],
-    release_gate_passed: object,
-    release_gate_candidate_sha: object,
+    qa_invocation_id: object,
+    release_gate: Mapping[str, object],
 ) -> bool:
     metadata = _mapping(evidence.get("host_metadata"))
     candidate_sha = evidence.get("candidate_sha")
@@ -301,14 +318,13 @@ def _is_verified_completion(
         evidence.get("product_complete") is not True
         or evidence.get("qa_status") != "pass"
         or checks_passed is not True
-        or release_gate_passed is not True
         or not isinstance(candidate_sha, str)
         or not candidate_sha
         or checks_candidate_sha != candidate_sha
-        or release_gate_candidate_sha != candidate_sha
         or not required
         or not required <= verified_required
         or _has_blocking_gap(evidence)
+        or not _valid_release_gate(release_gate, candidate_sha, qa_invocation_id)
     ):
         return False
     return _issue_state_is_complete(
@@ -329,27 +345,11 @@ def _issue_state_is_complete(
     latest_loop: Mapping[str, object],
     candidate_sha: str,
 ) -> bool:
-    issues = latest_loop.get("issues")
-    if issues is not None:
+    issues = latest_loop.get("issues", _MISSING)
+    if issues is not _MISSING:
         if issue_state_candidate_sha != candidate_sha:
             return False
-        if not isinstance(issues, Sequence) or isinstance(
-            issues, (str, bytes, bytearray)
-        ):
-            return False
-        records = _records(issues)
-        if len(records) != len(issues):
-            return False
-        for issue in records:
-            if issue.get("status") not in {"open", "closed", "regressed"}:
-                return False
-            if issue.get("severity") not in {"blocker", "major", "minor"}:
-                return False
-            if issue.get("status") in {"open", "regressed"} and issue.get(
-                "severity"
-            ) in {"blocker", "major"}:
-                return False
-        return True
+        return _valid_issue_entries(issues)
 
     if issue_state_candidate_sha != candidate_sha:
         return False
@@ -358,6 +358,93 @@ def _issue_state_is_complete(
         and issue_summary.get("severity_complete") is True
         and _nonnegative_integer(issue_summary.get("open_blocker")) == 0
         and _nonnegative_integer(issue_summary.get("open_major")) == 0
+    )
+
+
+def _valid_release_gate(
+    release_gate: Mapping[str, object], candidate_sha: str, qa_invocation_id: object
+) -> bool:
+    invocation_id = release_gate.get("invocation_id")
+    scope = release_gate.get("scope", release_gate.get("kind"))
+    return (
+        isinstance(qa_invocation_id, str)
+        and bool(qa_invocation_id)
+        and isinstance(invocation_id, str)
+        and bool(invocation_id)
+        and invocation_id != qa_invocation_id
+        and scope == "full_release"
+        and release_gate.get("qa_status") == "pass"
+        and release_gate.get("end_to_end_passed") is True
+        and release_gate.get("deterministic_checks_passed") is True
+        and release_gate.get("candidate_sha") == candidate_sha
+    )
+
+
+def _valid_issue_entries(value: object) -> bool:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return False
+    seen_claim_ids: set[str] = set()
+    for issue in value:
+        if not isinstance(issue, Mapping) or set(issue) != _ISSUE_FIELDS:
+            return False
+        claim_id = issue.get("claim_id")
+        if not isinstance(claim_id, str) or not claim_id or claim_id in seen_claim_ids:
+            return False
+        seen_claim_ids.add(claim_id)
+        status = issue.get("status")
+        if status not in _ISSUE_STATUSES or issue.get("severity") not in _GAP_SEVERITIES:
+            return False
+        if any(
+            not isinstance(issue.get(field), str) or not issue[field]
+            for field in _ISSUE_TEXT_FIELDS
+        ):
+            return False
+        if not _valid_issue_history(issue.get("history"), str(status)):
+            return False
+        if status in {"open", "regressed"} and issue.get("severity") not in _GAP_SEVERITIES:
+            return False
+    return True
+
+
+def _valid_issue_history(value: object, current_status: str) -> bool:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return False
+    if not value:
+        return False
+    previous_loop = 0
+    previous_status: str | None = None
+    for event in value:
+        if not isinstance(event, Mapping) or set(event) != _HISTORY_FIELDS:
+            return False
+        loop_index = event.get("loop")
+        if (
+            isinstance(loop_index, bool)
+            or not isinstance(loop_index, int)
+            or loop_index <= previous_loop
+            or not _is_candidate_sha(event.get("candidate"))
+        ):
+            return False
+        status = event.get("status")
+        if status not in _ISSUE_STATUSES or status not in _STATUS_TRANSITIONS[previous_status]:
+            return False
+        evidence_path = event.get("evidence_path")
+        if status == "closed":
+            if not isinstance(evidence_path, str) or not evidence_path:
+                return False
+        elif evidence_path is not None:
+            return False
+        if not isinstance(event.get("observation"), str) or not event["observation"]:
+            return False
+        previous_loop = loop_index
+        previous_status = str(status)
+    return previous_status == current_status
+
+
+def _is_candidate_sha(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 40 <= len(value) <= 64
+        and all(character in "0123456789abcdef" for character in value)
     )
 
 
