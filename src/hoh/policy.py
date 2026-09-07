@@ -401,7 +401,10 @@ def _valid_issue_entries(value: object) -> bool:
             return False
         if not _valid_issue_history(issue.get("history"), str(status)):
             return False
-        if status in {"open", "regressed"} and issue.get("severity") not in _GAP_SEVERITIES:
+        if status in {"open", "regressed"} and issue.get("severity") in {
+            "blocker",
+            "major",
+        }:
             return False
     return True
 

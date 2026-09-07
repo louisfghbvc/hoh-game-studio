@@ -293,6 +293,27 @@ def valid_closed_issue(claim_id: str) -> dict[str, object]:
     }
 
 
+def valid_issue(claim_id: str, status: str, severity: str) -> dict[str, object]:
+    issue = valid_closed_issue(claim_id)
+    issue["status"] = status
+    issue["severity"] = severity
+    history = issue["history"]
+    assert isinstance(history, list)
+    if status == "open":
+        issue["history"] = [history[0]]
+    elif status == "regressed":
+        history.append(
+            {
+                "loop": 3,
+                "candidate": "b" * 40,
+                "evidence_path": None,
+                "observation": "save behavior regressed",
+                "status": "regressed",
+            }
+        )
+    return issue
+
+
 def test_completion_rejects_issue_without_auditable_history() -> None:
     history = complete_history_at_loop_12()
     history[-1]["issues"] = [
@@ -342,3 +363,66 @@ def test_completion_accepts_a_strictly_valid_closed_issue() -> None:
     history[-1]["issues"] = [valid_closed_issue("save")]
 
     assert policy().evaluate(history).terminal_status == "complete"
+
+
+def test_completion_rejects_a_canonical_open_blocker_issue() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["issues"] = [valid_issue("save", "open", "blocker")]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_rejects_a_canonical_open_major_issue() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["issues"] = [valid_issue("save", "open", "major")]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_rejects_a_canonical_regressed_blocker_issue() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["issues"] = [valid_issue("save", "regressed", "blocker")]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_rejects_a_canonical_regressed_major_issue() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["issues"] = [valid_issue("save", "regressed", "major")]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_allows_a_canonical_open_minor_issue() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["issues"] = [valid_issue("save", "open", "minor")]
+
+    assert policy().evaluate(history).terminal_status == "complete"
+
+
+def test_completion_rejects_a_release_gate_with_wrong_scope() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["release_gate"]["scope"] = "smoke"  # type: ignore[index]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_rejects_a_release_gate_with_qa_failure() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["release_gate"]["qa_status"] = "fail"  # type: ignore[index]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_rejects_a_release_gate_with_failed_deterministic_checks() -> None:
+    history = complete_history_at_loop_12()
+    history[-1]["release_gate"]["deterministic_checks_passed"] = False  # type: ignore[index]
+
+    assert policy().evaluate(history).terminal_status != "complete"
+
+
+def test_completion_requires_an_ordinary_qa_invocation_id() -> None:
+    history = complete_history_at_loop_12()
+    history[-1].pop("qa_invocation_id")
+
+    assert policy().evaluate(history).terminal_status != "complete"
