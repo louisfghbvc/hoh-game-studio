@@ -1,0 +1,178 @@
+from pathlib import Path
+
+from hoh.models import HarnessConfig
+from hoh.policy import StopDecision, StopPolicy
+
+
+def policy() -> StopPolicy:
+    return StopPolicy(
+        HarnessConfig(
+            project=Path("."),
+            adapter="command",
+            model="test-model",
+            reasoning_effort="high",
+            codex_bin="codex",
+            max_loops=12,
+            max_priorities_per_loop=3,
+            max_role_retries=1,
+            max_consecutive_no_progress=3,
+            max_consecutive_same_blocker=3,
+            role_timeout_minutes=45,
+            max_total_tokens=100,
+            max_elapsed_minutes=10,
+            protected_paths=(".hoh", ".git"),
+        )
+    )
+
+
+def loop(
+    verified_claim_ids: set[str] = set(),
+    *,
+    required_claim_ids: set[str] = {"a"},
+    product_complete: bool = False,
+    gaps: list[dict[str, str]] | None = None,
+    issue_summary: dict[str, int] | None = None,
+    acceptance_claim_ids: set[str] = set(),
+    agent_completed: bool = False,
+) -> dict[str, object]:
+    return {
+        "normalized_evidence": {
+            "product_complete": product_complete,
+            "verified_records": [
+                {"claim_id": claim_id} for claim_id in sorted(verified_claim_ids)
+            ],
+            "gap_records": gaps or [],
+            "host_metadata": {
+                "deterministic_checks_passed": True,
+                "required_claim_ids": sorted(required_claim_ids),
+                "verified_required_claim_ids": sorted(
+                    verified_claim_ids & required_claim_ids
+                ),
+            },
+        },
+        "deterministic_checks_passed": True,
+        "issue_summary": issue_summary or {"total": 0, "open": 0, "closed": 0, "regressed": 0},
+        "acceptance_claim_ids": sorted(acceptance_claim_ids),
+        "agent_completed": agent_completed,
+    }
+
+
+def complete_history_at_loop_12() -> list[dict[str, object]]:
+    history = [loop({"a"})]
+    history[-1]["normalized_evidence"]["product_complete"] = True  # type: ignore[index]
+    return history * 12
+
+
+def gap_loop(claim_id: str) -> dict[str, object]:
+    return loop(gaps=[{"claim_id": claim_id, "severity": "blocker"}])
+
+
+def verified_loop(claim_ids: set[str]) -> dict[str, object]:
+    return loop(claim_ids)
+
+
+def test_verified_completion_wins_before_budget_stop() -> None:
+    decision = policy().evaluate(
+        history=complete_history_at_loop_12(), total_tokens=100, elapsed_seconds=600
+    )
+
+    assert decision == StopDecision(True, "complete", "all required claims verified")
+
+
+def test_same_blocker_three_times_stops() -> None:
+    history = [gap_loop("build:blocker") for _ in range(3)]
+
+    assert policy().evaluate(history).terminal_status == "blocked"
+
+
+def test_two_no_progress_loops_continue() -> None:
+    history = [verified_loop({"a"}), verified_loop({"a"})]
+
+    assert policy().evaluate(history).should_stop is False
+
+
+def test_three_no_progress_loops_stop() -> None:
+    history = [verified_loop({"a"}) for _ in range(4)]
+
+    assert policy().evaluate(history) == StopDecision(
+        True, "blocked", "no measurable evidence progress for 3 consecutive loops"
+    )
+
+
+def test_new_verified_required_claim_is_measurable_progress() -> None:
+    history = [
+        loop({"a"}, required_claim_ids={"a", "b"}),
+        loop({"a", "b"}, required_claim_ids={"a", "b"}),
+        loop({"a", "b"}, required_claim_ids={"a", "b"}),
+    ]
+
+    snapshot = policy().progress(history)
+
+    assert snapshot.made_progress is False
+    assert snapshot.consecutive_no_progress == 1
+    assert snapshot.verified_required_claim_ids == frozenset({"a", "b"})
+
+
+def test_reclosed_existing_issue_is_measurable_progress() -> None:
+    history = [
+        {**loop(), "issues": [{"claim_id": "save", "status": "open", "severity": "major"}]},
+        {**loop(), "issues": [{"claim_id": "save", "status": "closed", "severity": "major"}]},
+        {**loop(), "issues": [{"claim_id": "save", "status": "regressed", "severity": "major"}]},
+        {**loop(), "issues": [{"claim_id": "save", "status": "closed", "severity": "major"}]},
+    ]
+
+    snapshot = policy().progress(history)
+
+    assert snapshot.made_progress is True
+    assert snapshot.consecutive_no_progress == 0
+
+
+def test_new_file_or_agent_completion_claim_is_not_progress() -> None:
+    history = [
+        loop({"a"}),
+        {**loop({"a"}, agent_completed=True), "changed_paths": ["new-file.py"]},
+        {**loop({"a"}, agent_completed=True), "changed_paths": ["another-file.py"]},
+        {**loop({"a"}, agent_completed=True), "changed_paths": ["final-file.py"]},
+    ]
+
+    assert policy().evaluate(history).should_stop is True
+
+
+def test_explicit_cancellation_precedes_unrecoverable_failure() -> None:
+    decision = policy().evaluate(
+        [loop({"a"})],
+        cancelled=True,
+        unrecoverable_failure="infrastructure:codex-unavailable",
+    )
+
+    assert decision == StopDecision(True, "cancelled", "run cancelled by user")
+
+
+def test_unrecoverable_protocol_failure_precedes_repeated_blocker() -> None:
+    decision = policy().evaluate(
+        [gap_loop("build:blocker") for _ in range(3)],
+        unrecoverable_failure="protocol:invalid-evidence",
+    )
+
+    assert decision == StopDecision(
+        True, "blocked", "unrecoverable protocol failure: invalid-evidence"
+    )
+
+
+def test_token_elapsed_and_loop_budgets_stop_in_order() -> None:
+    decision = policy().evaluate(
+        [
+            loop({f"claim-{index}"}, required_claim_ids={f"claim-{index}"})
+            for index in range(12)
+        ],
+        total_tokens=100,
+        elapsed_seconds=600,
+    )
+
+    assert decision == StopDecision(True, "budget_exhausted", "token budget exhausted")
+
+
+def test_completion_requires_host_evidence_not_agent_claim() -> None:
+    decision = policy().evaluate([loop({"a"}, agent_completed=True)])
+
+    assert decision.should_stop is False
