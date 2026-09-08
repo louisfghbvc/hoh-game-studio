@@ -1,8 +1,8 @@
 # HoH Orchestrator Rewrite Design
 
-**Date:** 2026-09-07  
-**Repository:** `louisfghbvc/hoh-game-studio`  
-**Target branch:** `codex/hoh-rewrite`  
+**Date:** 2026-09-07
+**Repository:** `louisfghbvc/hoh-game-studio`
+**Target branch:** `codex/hoh-rewrite`
 **Status:** Approved design, pending implementation plan
 
 ## 1. Context
