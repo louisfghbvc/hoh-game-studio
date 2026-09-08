@@ -2826,9 +2826,9 @@ class HoHOrchestrator:
             / "tmp"
             / f"qa-{run_id}-loop-{loop_index:04d}-{uuid.uuid4().hex[:8]}",
         )
-        frozen = worktree.create(candidate_sha)
         body_error: BaseException | None = None
         try:
+            frozen = worktree.create(candidate_sha)
             if self.git.rev_parse_in(frozen, "HEAD") != candidate_sha:
                 raise ResumeError("QA worktree is not bound to the durable candidate")
             if self.git.current_branch_in(frozen):

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from hoh.vcs.git import GitError, GitService
-from hoh.vcs.worktree import QaWorktree
+from hoh.vcs.worktree import QaWorktree, QaWorktreeCleanupError
 
 
 def run_git(repo: Path, *args: str) -> str:
@@ -83,7 +83,8 @@ def test_create_excludes_long_tracked_host_state_when_repo_disables_longpaths(
     repo = initialized_repo(tmp_path)
     evidence_parent = repo / ".hoh" / "runs" / "run-a" / "loops" / "loop-0001"
     filename_length = 250 - len(str(evidence_parent)) - 1 - len(".json")
-    assert filename_length > 0
+    if filename_length <= 0:
+        pytest.skip("temporary repository path is already too long for this fixture")
     evidence = evidence_parent / ("r" * filename_length + ".json")
     assert len(str(evidence)) == 250
     evidence.parent.mkdir(parents=True)
@@ -107,6 +108,81 @@ def test_create_excludes_long_tracked_host_state_when_repo_disables_longpaths(
     with QaWorktree(GitService(repo), worktree_path) as frozen:
         assert (frozen / "product.txt").read_text(encoding="utf-8") == "original"
         assert not (frozen / ".hoh").exists()
+
+
+@pytest.mark.parametrize("failing_command", ("sparse-checkout", "checkout"))
+def test_partial_create_retains_cleanup_ownership_after_first_removal_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_command: str,
+) -> None:
+    """A caller's finally block must be able to retry partial-create cleanup."""
+
+    repo = initialized_repo(tmp_path)
+    git = GitService(repo)
+    worktree_path = repo / ".hoh" / "tmp" / "qa-partial"
+    worktree = QaWorktree(git, worktree_path)
+    original_run = git._run
+    original_remove = git._remove_worktree
+    removal_attempts = 0
+
+    def fail_setup(args, **kwargs):
+        if args[0] == failing_command:
+            raise GitError(f"simulated {failing_command} failure")
+        return original_run(args, **kwargs)
+
+    def fail_first_removal(path: Path) -> None:
+        nonlocal removal_attempts
+        removal_attempts += 1
+        if removal_attempts == 1:
+            raise GitError("simulated removal failure")
+        original_remove(path)
+
+    monkeypatch.setattr(git, "_run", fail_setup)
+    monkeypatch.setattr(git, "_remove_worktree", fail_first_removal)
+
+    with pytest.raises(QaWorktreeCleanupError) as captured:
+        with worktree:
+            raise AssertionError("partial worktree must not enter the body")
+
+    assert failing_command in str(captured.value.body_error)
+    assert "removal failure" in str(captured.value.cleanup_error)
+    assert removal_attempts == 2
+    assert not worktree_path.exists()
+    assert str(worktree_path.resolve()) not in run_git(repo, "worktree", "list")
+
+
+def test_partial_create_preserves_setup_and_prune_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune failure must retain the setup cause after removal succeeds."""
+
+    repo = initialized_repo(tmp_path)
+    git = GitService(repo)
+    worktree_path = repo / ".hoh" / "tmp" / "qa-prune"
+    worktree = QaWorktree(git, worktree_path)
+    original_run = git._run
+
+    def fail_sparse(args, **kwargs):
+        if args[0] == "sparse-checkout":
+            raise GitError("simulated sparse-checkout failure")
+        return original_run(args, **kwargs)
+
+    def fail_prune() -> None:
+        raise GitError("simulated prune failure")
+
+    monkeypatch.setattr(git, "_run", fail_sparse)
+    monkeypatch.setattr(git, "_prune_worktrees", fail_prune)
+
+    with pytest.raises(QaWorktreeCleanupError) as captured:
+        worktree.create(git.head_sha())
+
+    assert "sparse-checkout failure" in str(captured.value.body_error)
+    assert "prune failure" in str(captured.value.cleanup_error)
+    assert not worktree_path.exists()
+    assert str(worktree_path.resolve()) not in run_git(repo, "worktree", "list")
+    worktree.remove()
 
 
 def test_remove_refuses_a_path_outside_the_host_temp_root(tmp_path: Path) -> None:

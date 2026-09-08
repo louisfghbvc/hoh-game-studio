@@ -25,34 +25,53 @@ class QaWorktree:
     def __init__(self, git: GitService, path: Path) -> None:
         self._git = git
         self._path = Path(path)
-        self._created = False
+        self._registered = False
 
     def create(self, candidate_sha: str) -> Path:
         """Create a detached worktree fixed to *candidate_sha*."""
 
         path = self._validated_path()
-        if self._created:
+        if self._registered:
             raise GitError("QA worktree has already been created")
         candidate = self._git.rev_parse_in(
             self._git.repository, f"{candidate_sha}^{{commit}}"
         )
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._git._add_detached_worktree(path, candidate)
-        self._created = True
+        self._git._register_detached_worktree(path, candidate)
+        self._registered = True
+        try:
+            self._git._populate_detached_worktree(path, candidate)
+        except BaseException as setup_error:
+            try:
+                self.remove()
+            except GitError as cleanup_error:
+                raise QaWorktreeCleanupError(
+                    setup_error, cleanup_error
+                ) from cleanup_error
+            raise
         return path
 
     def remove(self) -> None:
         """Remove and prune a created worktree after validating its ownership boundary."""
 
         path = self._validated_path()
-        if not self._created:
+        if not self._registered:
             return
         self._git._remove_worktree(path)
-        self._created = False
+        self._registered = False
         self._git._prune_worktrees()
 
     def __enter__(self) -> Path:
-        return self.create(self._git.head_sha())
+        try:
+            return self.create(self._git.head_sha())
+        except BaseException as enter_error:
+            try:
+                self.remove()
+            except GitError as cleanup_error:
+                raise QaWorktreeCleanupError(
+                    enter_error, cleanup_error
+                ) from cleanup_error
+            raise
 
     def __exit__(
         self,
