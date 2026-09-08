@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HoH frozen-candidate QA evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "iteration",
+    "candidate_sha",
+    "artifact_tree_sha256",
+    "qa_status",
+    "product_complete",
+    "verified_records",
+    "gap_records",
+    "planner_handoff"
+  ],
+  "properties": {
+    "iteration": {"type": "integer", "minimum": 1},
+    "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+    "artifact_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "qa_status": {
+      "enum": ["pass", "fail", "insufficient_evidence"]
+    },
+    "product_complete": {"type": "boolean"},
+    "verified_records": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/verified_record"}
+    },
+    "gap_records": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/gap_record"}
+    },
+    "planner_handoff": {"$ref": "#/$defs/planner_handoff"}
+  },
+  "if": {
+    "properties": {"product_complete": {"const": true}},
+    "required": ["product_complete"]
+  },
+  "then": {
+    "properties": {
+      "verified_records": {"minItems": 1}
+    }
+  },
+  "$defs": {
+    "execution_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "path", "sha256", "observation"],
+      "properties": {
+        "type": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "observation": {"type": "string", "minLength": 1}
+      }
+    },
+    "verified_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claim_id",
+        "claim",
+        "observations",
+        "execution_records",
+        "preservation_requirement"
+      ],
+      "properties": {
+        "claim_id": {"type": "string", "minLength": 1},
+        "claim": {"type": "string", "minLength": 1},
+        "observations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "execution_records": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/execution_record"}
+        },
+        "preservation_requirement": {"type": "string", "minLength": 1}
+      }
+    },
+    "gap_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claim_id",
+        "severity",
+        "impact",
+        "observations",
+        "recommended_update",
+        "validation_requirement"
+      ],
+      "properties": {
+        "claim_id": {"type": "string", "minLength": 1},
+        "severity": {"enum": ["blocker", "major", "minor"]},
+        "impact": {"type": "string", "minLength": 1},
+        "observations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "recommended_update": {"type": "string", "minLength": 1},
+        "validation_requirement": {"type": "string", "minLength": 1}
+      }
+    },
+    "planner_handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "preservation_constraints",
+        "update_targets",
+        "validation_requirements"
+      ],
+      "properties": {
+        "preservation_constraints": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "update_targets": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "validation_requirements": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

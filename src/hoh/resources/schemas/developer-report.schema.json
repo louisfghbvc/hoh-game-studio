@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HoH developer report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "completed_priority_ids", "self_tests", "known_gaps"],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1},
+    "completed_priority_ids": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "self_tests": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "known_gaps": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    }
+  }
+}

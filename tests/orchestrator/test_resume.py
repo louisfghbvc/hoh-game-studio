@@ -1,0 +1,1117 @@
+import hashlib
+import json
+import re
+import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from hoh.adapters import CommandAdapter
+from hoh.backends import BackendTimeout, FakeAgentBackend, FakeResponse
+from hoh.models import Role
+from hoh.orchestrator import ResumeError
+from hoh.policy import StopPolicy
+from hoh.state.evidence import EvidenceBindingError
+from hoh.state.store import StateConflictError
+
+from tests.orchestrator.helpers import (
+    count_candidate_commits,
+    crashed_after_candidate_fixture,
+    RecordingAdapter,
+    ScriptedBackend,
+    Services,
+    build_services,
+    config_for,
+    developer_change,
+    developer_response,
+    initialized_product,
+    orchestrator_fixture,
+    plan,
+    qa_response,
+    run_git,
+)
+
+
+def _crash_immediately_after_successful_qa_invocation(
+    tmp_path: Path, invocation_kind: str
+) -> tuple[Path, Services, Path, dict[str, object]]:
+    project = initialized_product(tmp_path)
+    responses = [
+        FakeResponse(plan()),
+        FakeResponse(developer_response(), on_run=developer_change),
+        FakeResponse(
+            lambda request: qa_response(
+                request, include_major_gap=invocation_kind == "ordinary"
+            )
+        ),
+    ]
+    if invocation_kind == "full-release":
+        responses.append(
+            FakeResponse(lambda request: qa_response(request, include_major_gap=False))
+        )
+    services = build_services(project, FakeAgentBackend(responses), RecordingAdapter())
+    invoke_role = services.orchestrator._invoke_role
+    crashed = False
+
+    def invoke_then_crash(*args, **kwargs):
+        nonlocal crashed
+        result = invoke_role(*args, **kwargs)
+        if (
+            not crashed
+            and args[3] is Role.QA
+            and kwargs.get("invocation_kind") == invocation_kind
+        ):
+            crashed = True
+            raise RuntimeError(f"crash after {invocation_kind} QA invocation")
+        return result
+
+    services.orchestrator._invoke_role = invoke_then_crash  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match=f"after {invocation_kind} QA"):
+        services.orchestrator.run(max_loops=1)
+    services.orchestrator._invoke_role = invoke_role  # type: ignore[method-assign]
+    run_dir = next((project / ".hoh" / "runs").iterdir())
+    receipt_name = (
+        "qa-attempt-01.json"
+        if invocation_kind == "ordinary"
+        else "qa-full-release-attempt-01.json"
+    )
+    receipt = json.loads(
+        (run_dir / "loops" / "loop-0001" / "receipts" / receipt_name).read_text(
+            encoding="utf-8"
+        )
+    )
+    return project, services, run_dir, receipt
+
+
+def _assert_receipt_response_is_hash_bound(
+    project: Path, receipt: dict[str, object]
+) -> Path:
+    descriptor = receipt["response"]
+    assert isinstance(descriptor, dict)
+    assert set(descriptor) == {"path", "sha256"}
+    path = project / str(descriptor["path"])
+    assert path.is_file()
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == descriptor["sha256"]
+    return path
+
+
+def _command_adapter_qa_response(request) -> dict[str, object]:
+    artifact_path = (
+        "release-adapter/checks/command-0001.json"
+        if "release-adapter/checks/command-0001.json" in request.prompt
+        else "adapter/checks/command-0001.json"
+    )
+    candidates = re.findall(
+        r'"candidate_sha":\s*"([0-9a-f]{40,64})"', request.prompt
+    )
+    trees = re.findall(
+        r'"artifact_tree_sha256":\s*"([0-9a-f]{64})"', request.prompt
+    )
+    artifact_match = re.search(
+        rf'"{re.escape(artifact_path)}":\s*"([0-9a-f]{{64}})"', request.prompt
+    )
+    assert candidates and trees and artifact_match is not None
+    return {
+        "iteration": 1,
+        "candidate_sha": candidates[-1],
+        "artifact_tree_sha256": trees[-1],
+        "qa_status": "pass",
+        "product_complete": False,
+        "verified_records": [
+            {
+                "claim_id": "claim-main",
+                "claim": "Main behavior works",
+                "observations": ["The retained command completed."],
+                "execution_records": [
+                    {
+                        "type": "command-result",
+                        "path": artifact_path,
+                        "sha256": artifact_match.group(1),
+                        "observation": "The command metadata records success.",
+                    }
+                ],
+                "preservation_requirement": "Keep the command check passing",
+            }
+        ],
+        "gap_records": [],
+        "planner_handoff": {
+            "preservation_constraints": ["Preserve claim-main"],
+            "update_targets": [],
+            "validation_requirements": ["Run the command check"],
+        },
+    }
+
+
+def _crash_after_command_full_release_qa(
+    tmp_path: Path,
+) -> tuple[Path, Services, CommandAdapter, Path, dict[str, object]]:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(_command_adapter_qa_response),
+            FakeResponse(_command_adapter_qa_response),
+        ]
+    )
+    adapter = CommandAdapter(
+        checks=((sys.executable, "-c", "print('stable command evidence')"),),
+        timeout_seconds=5,
+    )
+    services = build_services(project, backend, adapter)  # type: ignore[arg-type]
+    invoke_role = services.orchestrator._invoke_role
+
+    def invoke_then_crash(*args, **kwargs):
+        result = invoke_role(*args, **kwargs)
+        if args[3] is Role.QA and kwargs.get("invocation_kind") == "full-release":
+            raise RuntimeError("crash after command full-release QA invocation")
+        return result
+
+    services.orchestrator._invoke_role = invoke_then_crash  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="after command full-release QA"):
+        services.orchestrator.run(max_loops=1)
+    services.orchestrator._invoke_role = invoke_role  # type: ignore[method-assign]
+    run_dir = next((project / ".hoh" / "runs").iterdir())
+    receipt_path = (
+        run_dir
+        / "loops"
+        / "loop-0001"
+        / "receipts"
+        / "qa-full-release-attempt-01.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    return project, services, adapter, run_dir, receipt
+
+
+def _assert_project_descriptor(
+    project: Path, descriptor: object
+) -> tuple[Path, dict[str, object]]:
+    assert isinstance(descriptor, dict)
+    assert set(descriptor) == {"path", "sha256"}
+    path = project / str(descriptor["path"])
+    assert path.is_file()
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == descriptor["sha256"]
+    return path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_resume_does_not_repeat_completed_developer(tmp_path: Path) -> None:
+    project, services = crashed_after_candidate_fixture(tmp_path)
+    original_candidate = services.git.head_sha()
+    assert not any((project / ".hoh" / "tmp").glob("qa-*"))
+
+    result = services.orchestrator.resume()
+
+    assert [request.role for request in services.backend.requests] == [Role.QA]
+    assert result["current_candidate"] == original_candidate
+    assert count_candidate_commits(project) == 1
+    assert not any((project / ".hoh" / "tmp").glob("qa-*"))
+
+
+def test_resume_replays_successful_ordinary_qa_receipt_without_backend(
+    tmp_path: Path,
+) -> None:
+    project, services, run_dir, receipt = (
+        _crash_immediately_after_successful_qa_invocation(tmp_path, "ordinary")
+    )
+    response_descriptor = dict(receipt["response"])
+    _assert_receipt_response_is_hash_bound(project, receipt)
+    phase_path = run_dir / "loops" / "loop-0001" / "phase-state.json"
+    phase = json.loads(phase_path.read_text(encoding="utf-8"))
+    assert "qa" not in phase["completed"]
+    services.backend.requests.clear()
+
+    result = services.orchestrator.resume()
+
+    assert services.backend.requests == []
+    assert result["terminal_status"] == "budget_exhausted"
+    phase = json.loads(phase_path.read_text(encoding="utf-8"))
+    qa_phase = phase["completed"]["qa"]["payload"]
+    assert qa_phase["qa_invocation_id"] == receipt["invocation_id"]
+    assert qa_phase["response"] == response_descriptor
+
+
+def test_resume_replays_successful_full_release_qa_receipt_without_backend(
+    tmp_path: Path,
+) -> None:
+    project, services, run_dir, receipt = (
+        _crash_immediately_after_successful_qa_invocation(tmp_path, "full-release")
+    )
+    response_descriptor = dict(receipt["response"])
+    _assert_receipt_response_is_hash_bound(project, receipt)
+    gate_path = run_dir / "loops" / "loop-0001" / "release-gate.json"
+    assert not gate_path.exists()
+    services.backend.requests.clear()
+
+    result = services.orchestrator.resume()
+
+    assert services.backend.requests == []
+    assert result["terminal_status"] == "complete"
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    assert gate["invocation_id"] == receipt["invocation_id"]
+    assert gate["response"] == response_descriptor
+
+
+def test_resume_replays_command_release_context_without_adapter_or_qa(
+    tmp_path: Path,
+) -> None:
+    project, services, adapter, run_dir, receipt = (
+        _crash_after_command_full_release_qa(tmp_path)
+    )
+    context_path, context = _assert_project_descriptor(project, receipt["context"])
+    assert context_path.name.startswith("release-context-")
+    assert context["artifacts"] == json.loads(
+        (run_dir / "loops" / "loop-0001" / "release-adapter-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )["artifacts"]
+    cited_path = (
+        run_dir
+        / "loops"
+        / "loop-0001"
+        / "release-adapter"
+        / "checks"
+        / "command-0001.json"
+    )
+    assert "release-adapter/checks/command-0001.json" in context["artifacts"]
+    cited_bytes = cited_path.read_bytes()
+    calls = {"check": 0, "collect": 0}
+    original_check = adapter.check
+    original_collect = adapter.collect
+
+    def counted_check(*args, **kwargs):
+        calls["check"] += 1
+        return original_check(*args, **kwargs)
+
+    def counted_collect(*args, **kwargs):
+        calls["collect"] += 1
+        return original_collect(*args, **kwargs)
+
+    adapter.check = counted_check  # type: ignore[method-assign]
+    adapter.collect = counted_collect  # type: ignore[method-assign]
+    services.backend.requests.clear()
+
+    result = services.orchestrator.resume()
+
+    assert result["terminal_status"] == "complete"
+    assert services.backend.requests == []
+    assert calls == {"check": 0, "collect": 0}
+    assert cited_path.read_bytes() == cited_bytes
+    gate = json.loads(
+        (run_dir / "loops" / "loop-0001" / "release-gate.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert gate["context"] == receipt["context"]
+    assert gate["response"] == receipt["response"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-context",
+        "tampered-context",
+        "mismatched-context",
+        "tampered-selected-artifact",
+    ],
+)
+def test_release_context_corruption_fails_before_adapter_or_qa(
+    tmp_path: Path, mutation: str
+) -> None:
+    project, services, adapter, run_dir, receipt = (
+        _crash_after_command_full_release_qa(tmp_path)
+    )
+    context_path, context = _assert_project_descriptor(project, receipt["context"])
+    receipt_path = (
+        run_dir
+        / "loops"
+        / "loop-0001"
+        / "receipts"
+        / "qa-full-release-attempt-01.json"
+    )
+    if mutation == "missing-context":
+        context_path.unlink()
+    elif mutation == "tampered-context":
+        context_path.write_text("{}\n", encoding="utf-8")
+    elif mutation == "mismatched-context":
+        receipt["context"] = receipt["response"]
+        receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    else:
+        artifact_relative = "release-adapter/checks/command-0001.json"
+        assert artifact_relative in context["artifacts"]
+        (
+            run_dir
+            / "loops"
+            / "loop-0001"
+            / "release-adapter"
+            / "checks"
+            / "command-0001.json"
+        ).write_text("{}\n", encoding="utf-8")
+    calls = 0
+
+    def unexpected_adapter_call(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("release adapter must not run before context validation")
+
+    adapter.check = unexpected_adapter_call  # type: ignore[method-assign]
+    adapter.collect = unexpected_adapter_call  # type: ignore[method-assign]
+    services.backend.requests.clear()
+
+    with pytest.raises(StateConflictError, match="release|context|artifact"):
+        services.orchestrator.resume()
+
+    assert calls == 0
+    assert services.backend.requests == []
+
+
+@pytest.mark.parametrize("invocation_kind", ["ordinary", "full-release"])
+@pytest.mark.parametrize("mutation", ["missing", "tampered"])
+def test_resume_fails_closed_when_successful_qa_receipt_response_is_unavailable(
+    tmp_path: Path, invocation_kind: str, mutation: str
+) -> None:
+    project, services, _, receipt = _crash_immediately_after_successful_qa_invocation(
+        tmp_path, invocation_kind
+    )
+    response_path = _assert_receipt_response_is_hash_bound(project, receipt)
+    if mutation == "missing":
+        response_path.unlink()
+    else:
+        response_path.write_text("{}\n", encoding="utf-8")
+    services.backend.requests.clear()
+
+    with pytest.raises(StateConflictError, match="response|artifact|receipt"):
+        services.orchestrator.resume()
+
+    assert services.backend.requests == []
+
+
+def test_resume_after_ledger_apply_uses_phase_bound_qa_evidence_without_reinvoking(
+    tmp_path: Path,
+) -> None:
+    """Journaling QA after ledger mutation must make this crash window fail."""
+
+    project, services = orchestrator_fixture(tmp_path)
+    ledger = services.orchestrator.issue_ledger
+    apply = ledger.apply
+    crashed = False
+
+    def apply_then_crash(evidence, loop_index):
+        nonlocal crashed
+        result = apply(evidence, loop_index)
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash immediately after ledger apply")
+        return result
+
+    ledger.apply = apply_then_crash  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="immediately after ledger apply"):
+        services.orchestrator.run(max_loops=1)
+    ledger.apply = apply  # type: ignore[method-assign]
+
+    run_dir = next((project / ".hoh" / "runs").iterdir())
+    loop_dir = run_dir / "loops" / "loop-0001"
+    phase_path = loop_dir / "phase-state.json"
+    phase_bytes = phase_path.read_bytes()
+    phase = json.loads(phase_bytes)
+    qa_payload = phase["completed"]["qa"]["payload"]
+    assert qa_payload["qa_invocation_id"].endswith(":qa:ordinary:attempt-01")
+    assert set(qa_payload) >= {"response", "evidence", "qa_invocation_id"}
+    candidate_sha = services.git.head_sha()
+    services.backend.requests.clear()
+    phase["completed"]["qa"]["payload"]["qa_invocation_id"] = "different-qa"
+    phase_path.write_text(json.dumps(phase) + "\n", encoding="utf-8")
+    with pytest.raises(StateConflictError, match="invocation identity"):
+        services.orchestrator.inspect_latest()
+    assert services.backend.requests == []
+    phase_path.write_bytes(phase_bytes)
+    response_path = project.joinpath(*Path(qa_payload["response"]["path"]).parts)
+    response_bytes = response_path.read_bytes()
+    response_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(StateConflictError, match="response|artifact"):
+        services.orchestrator.inspect_latest()
+    assert services.backend.requests == []
+    response_path.write_bytes(response_bytes)
+
+    result = services.orchestrator.resume()
+
+    assert services.backend.requests == []
+    assert result["current_candidate"] == candidate_sha
+    assert services.orchestrator.inspect_latest()[1]["completed_loops"] == 1
+    ledger_document = ledger.load()
+    assert len(ledger_document["applications"]) == 1
+
+
+def test_expected_resume_id_is_checked_inside_the_product_lock_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    project, services = crashed_after_candidate_fixture(tmp_path)
+    run_path = next((project / ".hoh" / "runs").glob("*/run.json"))
+    state_before = run_path.read_bytes()
+    head_before = services.git.head_sha()
+    selected = services.orchestrator._latest_resumable_run
+
+    def selected_while_locked():
+        assert (project / ".hoh" / "lock").is_file()
+        return selected()
+
+    services.orchestrator._latest_resumable_run = (  # type: ignore[method-assign]
+        selected_while_locked
+    )
+
+    with pytest.raises(ResumeError, match="newest resumable run"):
+        services.orchestrator.resume(expected_run_id="not-the-newest-run")
+
+    assert services.backend.requests == []
+    assert services.git.head_sha() == head_before
+    assert run_path.read_bytes() == state_before
+    assert not (project / ".hoh" / "lock").exists()
+
+
+def test_resume_rejects_tampered_completed_candidate_metadata(tmp_path: Path) -> None:
+    project, services = crashed_after_candidate_fixture(tmp_path)
+    candidate_path = next((project / ".hoh" / "runs").glob("*/loops/loop-0001/candidate.json"))
+    candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    candidate["candidate_sha"] = "b" * 40
+    candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+
+    with pytest.raises(StateConflictError, match="candidate"):
+        services.orchestrator.resume()
+
+    assert services.backend.requests == []
+    assert count_candidate_commits(project) == 1
+
+
+def test_resume_recovers_candidate_commit_that_landed_before_metadata(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    land = services.git.land_prepared_commit
+
+    def land_then_crash(prepared) -> str:
+        result = land(prepared)
+        if prepared.kind == "candidate":
+            raise RuntimeError("crash after candidate commit")
+        return result
+
+    services.git.land_prepared_commit = land_then_crash  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="crash after candidate commit"):
+        services.orchestrator.run(max_loops=1)
+    services.git.land_prepared_commit = land  # type: ignore[method-assign]
+    services.backend.requests.clear()
+    landed_candidate = services.git.head_sha()
+
+    _, inspected = services.orchestrator.inspect_latest()
+    assert inspected["status"] == "resumable"
+    assert inspected["completed_loops"] == 0
+
+    result = services.orchestrator.resume()
+
+    assert [request.role for request in services.backend.requests] == [Role.QA]
+    assert result["current_candidate"] == landed_candidate
+    assert count_candidate_commits(project) == 1
+
+
+def test_resume_rejects_external_direct_child_in_candidate_crash_window(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    land = services.git.land_prepared_commit
+
+    def crash_before_land(prepared) -> str:
+        raise RuntimeError(f"crash before landing {prepared.kind}")
+
+    services.git.land_prepared_commit = crash_before_land  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="crash before landing candidate"):
+        services.orchestrator.run(max_loops=1)
+    services.git.land_prepared_commit = land  # type: ignore[method-assign]
+    backend.requests.clear()
+    run_git(
+        project,
+        "-c",
+        "user.name=external",
+        "-c",
+        "user.email=external@example.test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "unexpected empty candidate",
+    )
+
+    with pytest.raises(StateConflictError, match="candidate|prepared|intent|HEAD"):
+        services.orchestrator.resume()
+
+    assert backend.requests == []
+    assert (project / "product.txt").read_text(encoding="utf-8") == "changed\n"
+
+
+def test_resume_rejects_candidate_with_expected_tree_but_wrong_identity(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    land = services.git.land_prepared_commit
+
+    def land_then_crash(prepared) -> str:
+        landed = land(prepared)
+        raise RuntimeError(f"crash after landing {prepared.kind}: {landed}")
+
+    services.git.land_prepared_commit = land_then_crash  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="crash after landing candidate"):
+        services.orchestrator.run(max_loops=1)
+    services.git.land_prepared_commit = land  # type: ignore[method-assign]
+    backend.requests.clear()
+    run_git(
+        project,
+        "-c",
+        "user.name=external",
+        "-c",
+        "user.email=external@example.test",
+        "commit",
+        "--amend",
+        "--no-edit",
+        "--author=external <external@example.test>",
+    )
+
+    with pytest.raises(StateConflictError, match="candidate|prepared|intent|HEAD"):
+        services.orchestrator.resume()
+
+    assert backend.requests == []
+
+
+def test_resume_rejects_extra_product_path_injected_after_development_journal(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    prepare = services.git.prepare_candidate
+    services.git.prepare_candidate = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("crash after development journal")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="development journal"):
+        services.orchestrator.run(max_loops=1)
+    services.git.prepare_candidate = prepare  # type: ignore[method-assign]
+    backend.requests.clear()
+    (project / "injected-after-development.txt").write_text(
+        "external mutation\n", encoding="utf-8"
+    )
+
+    with pytest.raises(StateConflictError, match="manifest|mutation|product"):
+        services.orchestrator.resume()
+
+    assert backend.requests == []
+    assert count_candidate_commits(project) == 0
+
+
+def test_resume_rejects_same_path_content_changed_after_development_journal(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    prepare = services.git.prepare_candidate
+    services.git.prepare_candidate = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("crash after development journal")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="development journal"):
+        services.orchestrator.run(max_loops=1)
+    services.git.prepare_candidate = prepare  # type: ignore[method-assign]
+    backend.requests.clear()
+    (project / "product.txt").write_text(
+        "mutated after durable development\n", encoding="utf-8"
+    )
+
+    with pytest.raises(StateConflictError, match="manifest|mutation|content"):
+        services.orchestrator.resume()
+
+    assert backend.requests == []
+    assert count_candidate_commits(project) == 0
+
+
+def test_candidate_prepare_rejects_bytes_mutated_during_literal_staging(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    run_git_command = services.git._run
+    mutated = False
+
+    def mutate_at_add(arguments, **kwargs):
+        nonlocal mutated
+        environment = kwargs.get("env") or {}
+        if (
+            not mutated
+            and tuple(arguments[:2]) == ("add", "--all")
+            and "GIT_AUTHOR_NAME" in environment
+        ):
+            mutated = True
+            (project / "product.txt").write_text(
+                "mutated at staging boundary\n", encoding="utf-8"
+            )
+        return run_git_command(arguments, **kwargs)
+
+    services.git._run = mutate_at_add  # type: ignore[method-assign]
+
+    with pytest.raises(StateConflictError, match="manifest|candidate|staged|content"):
+        services.orchestrator.run(max_loops=1)
+
+    assert mutated is True
+    assert count_candidate_commits(project) == 0
+
+
+def test_candidate_prepare_rejects_deleted_path_recreated_during_staging(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    obsolete = project / "obsolete.txt"
+    obsolete.write_text("tracked obsolete content\n", encoding="utf-8")
+    run_git(project, "add", "obsolete.txt")
+    run_git(
+        project,
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-m",
+        "add obsolete fixture",
+    )
+
+    def delete_obsolete(request) -> None:
+        developer_change(request)
+        (request.workspace / "obsolete.txt").unlink()
+
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=delete_obsolete),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    run_git_command = services.git._run
+    recreated = False
+
+    def recreate_at_add(arguments, **kwargs):
+        nonlocal recreated
+        environment = kwargs.get("env") or {}
+        if (
+            not recreated
+            and tuple(arguments[:2]) == ("add", "--all")
+            and "GIT_AUTHOR_NAME" in environment
+        ):
+            recreated = True
+            obsolete.write_text("recreated at staging boundary\n", encoding="utf-8")
+        return run_git_command(arguments, **kwargs)
+
+    services.git._run = recreate_at_add  # type: ignore[method-assign]
+
+    with pytest.raises(StateConflictError, match="manifest|candidate|staged|delet"):
+        services.orchestrator.run(max_loops=1)
+
+    assert recreated is True
+    assert count_candidate_commits(project) == 0
+
+
+def test_resume_recovers_evidence_commit_that_landed_before_closure_journal(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    land = services.git.land_prepared_commit
+
+    def land_then_crash(prepared) -> str:
+        result = land(prepared)
+        if prepared.kind == "evidence":
+            raise RuntimeError("crash after evidence commit")
+        return result
+
+    services.git.land_prepared_commit = land_then_crash  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="crash after evidence commit"):
+        services.orchestrator.run(max_loops=1)
+    services.git.land_prepared_commit = land  # type: ignore[method-assign]
+    services.backend.requests.clear()
+    evidence_head = services.git.head_sha()
+
+    _, inspected = services.orchestrator.inspect_latest()
+    assert inspected["status"] == "resumable"
+    assert inspected["completed_loops"] == 0
+
+    result = services.orchestrator.resume()
+
+    assert services.backend.requests == []
+    assert services.git.head_sha() == evidence_head
+    messages = run_git(project, "log", "--format=%s").splitlines()
+    assert sum(message.startswith("test(loop-") for message in messages) == 1
+    assert result["loops_completed"] == 1
+
+
+def test_resume_rejects_partial_external_evidence_commit_in_crash_window(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    land = services.git.land_prepared_commit
+
+    def crash_before_evidence_land(prepared) -> str:
+        if prepared.kind == "evidence":
+            raise RuntimeError("crash before landing evidence")
+        return land(prepared)
+
+    services.git.land_prepared_commit = crash_before_evidence_land  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="crash before landing evidence"):
+        services.orchestrator.run(max_loops=1)
+    services.git.land_prepared_commit = land  # type: ignore[method-assign]
+    backend.requests.clear()
+    evidence = next(
+        (project / ".hoh" / "runs").glob("*/loops/loop-0001/evidence.json")
+    )
+    run_git(project, "add", "--", str(evidence.relative_to(project)))
+    run_git(
+        project,
+        "-c",
+        "user.name=external",
+        "-c",
+        "user.email=external@example.test",
+        "commit",
+        "-m",
+        "partial external evidence",
+    )
+
+    with pytest.raises(StateConflictError, match="evidence|prepared|intent|HEAD"):
+        services.orchestrator.resume()
+
+    assert backend.requests == []
+    tracked = run_git(project, "ls-tree", "-r", "--name-only", "HEAD")
+    assert "receipt.json" not in tracked
+
+
+def test_resume_never_grants_more_than_two_total_role_attempts(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = ScriptedBackend(
+        [
+            BackendTimeout("first timeout"),
+            BackendTimeout("second timeout"),
+            FakeResponse(plan()),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+
+    with pytest.raises(BackendTimeout, match="second timeout"):
+        services.orchestrator.run(max_loops=1)
+    run_path = next((project / ".hoh" / "runs").glob("*/run.json"))
+    state = json.loads(run_path.read_text(encoding="utf-8"))
+    state["status"] = "resumable"
+    run_path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(StateConflictError, match="attempt|retry|receipt"):
+        services.orchestrator.resume()
+
+    assert len(backend.requests) == 2
+    receipts = sorted(run_path.parent.glob("loops/loop-0001/receipts/planner-*.json"))
+    assert len(receipts) == 2
+
+
+def test_resume_fails_closed_on_malformed_attempt_receipt_history(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = ScriptedBackend(
+        [
+            BackendTimeout("first timeout"),
+            RuntimeError("simulated process crash"),
+            FakeResponse(plan()),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        services.orchestrator.run(max_loops=1)
+    run_path = next((project / ".hoh" / "runs").glob("*/run.json"))
+    receipt_path = next(
+        run_path.parent.glob("loops/loop-0001/receipts/planner-attempt-01.json")
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["attempt"] = 7
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(StateConflictError, match="attempt|receipt"):
+        services.orchestrator.resume()
+
+    assert len(backend.requests) == 2
+
+
+def test_resume_rejects_renamed_attempt_receipt_before_another_backend_call(
+    tmp_path: Path,
+) -> None:
+    project = initialized_product(tmp_path)
+    backend = ScriptedBackend(
+        [BackendTimeout("first timeout"), FakeResponse(plan())]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    repair_prompt = services.orchestrator._repair_prompt
+    services.orchestrator._repair_prompt = (  # type: ignore[method-assign]
+        lambda prompt, error: (_ for _ in ()).throw(
+            RuntimeError("simulated process loss before retry")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="process loss"):
+        services.orchestrator.run(max_loops=1)
+    services.orchestrator._repair_prompt = repair_prompt  # type: ignore[method-assign]
+    receipt = next(
+        (project / ".hoh" / "runs").glob(
+            "*/loops/loop-0001/receipts/planner-attempt-01.json"
+        )
+    )
+    receipt.rename(receipt.with_name("planner-renamed-attempt-01.json"))
+
+    with pytest.raises(StateConflictError, match="receipt|filename|attempt"):
+        services.orchestrator.resume()
+
+    assert len(backend.requests) == 1
+
+
+def test_elapsed_time_rebases_once_when_a_later_loop_resumes(tmp_path: Path) -> None:
+    project = initialized_product(tmp_path)
+
+    class Clock:
+        elapsed = 0.0
+        epoch = datetime(2026, 1, 1, tzinfo=UTC)
+
+        def monotonic(self) -> float:
+            return self.elapsed
+
+        def now(self) -> datetime:
+            return self.epoch + timedelta(seconds=self.elapsed)
+
+        def advance(self, seconds: float) -> None:
+            self.elapsed += seconds
+
+    class Policy:
+        def __init__(self, delegate: StopPolicy) -> None:
+            self.delegate = delegate
+            self.elapsed: list[int] = []
+
+        def evaluate(self, history, **kwargs):
+            self.elapsed.append(kwargs.get("elapsed_seconds", 0))
+            return self.delegate.evaluate(history, **kwargs)
+
+    clock = Clock()
+    config = config_for(project)
+    policy = Policy(StopPolicy(config))
+
+    def change_for(index: int):
+        def change(request) -> None:
+            developer_change(request, f"changed-{index}\n")
+            clock.advance(30)
+
+        return change
+
+    def qa_for(index: int):
+        def respond(request):
+            clock.advance(30)
+            return qa_response(request, iteration=index)
+
+        return respond
+
+    backend = ScriptedBackend(
+        [
+            FakeResponse(plan(1)),
+            FakeResponse(developer_response("loop one"), on_run=change_for(1)),
+            FakeResponse(qa_for(1)),
+            BackendTimeout("pause before retry"),
+            FakeResponse(plan(2)),
+            FakeResponse(developer_response("loop two"), on_run=change_for(2)),
+            FakeResponse(qa_for(2)),
+        ]
+    )
+    services = build_services(
+        project,
+        backend,
+        RecordingAdapter(),
+        config=config,
+        policy=policy,  # type: ignore[arg-type]
+        orchestrator_options={"now": clock.now, "monotonic": clock.monotonic},
+    )
+    repair_prompt = services.orchestrator._repair_prompt
+    services.orchestrator._repair_prompt = (  # type: ignore[method-assign]
+        lambda prompt, error: (_ for _ in ()).throw(
+            RuntimeError("simulated process loss before retry")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="process loss"):
+        services.orchestrator.run(max_loops=2)
+    services.orchestrator._repair_prompt = repair_prompt  # type: ignore[method-assign]
+
+    result = services.orchestrator.resume()
+
+    assert result["loops_completed"] == 2
+    assert policy.elapsed == [60, 120]
+    state = json.loads(
+        (
+            project / ".hoh" / "runs" / result["run_id"] / "run.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert state["elapsed_seconds"] == 120
+
+
+def test_resume_rejects_tampered_release_gate_check_record(tmp_path: Path) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(lambda request: qa_response(request, include_major_gap=False)),
+            FakeResponse(lambda request: qa_response(request, include_major_gap=False)),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    land = services.git.land_prepared_commit
+
+    def crash_before_evidence(prepared) -> str:
+        if prepared.kind == "evidence":
+            raise RuntimeError("crash before evidence commit")
+        return land(prepared)
+
+    services.git.land_prepared_commit = crash_before_evidence  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="crash before evidence commit"):
+        services.orchestrator.run(max_loops=1)
+    services.git.land_prepared_commit = land  # type: ignore[method-assign]
+    services.backend.requests.clear()
+    release_checks = next((project / ".hoh" / "runs").glob("*/loops/loop-0001/release-checks.json"))
+    release_checks.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(StateConflictError, match="release|checks"):
+        services.orchestrator.resume()
+
+    assert services.backend.requests == []
+
+
+def test_resume_revalidates_cited_evidence_files_before_closure(tmp_path: Path) -> None:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(qa_response),
+        ]
+    )
+    services = build_services(project, backend, RecordingAdapter())
+    land = services.git.land_prepared_commit
+
+    def crash_before_evidence(prepared) -> str:
+        if prepared.kind == "evidence":
+            raise RuntimeError("crash before evidence commit")
+        return land(prepared)
+
+    services.git.land_prepared_commit = crash_before_evidence  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="crash before evidence commit"):
+        services.orchestrator.run(max_loops=1)
+    services.git.land_prepared_commit = land  # type: ignore[method-assign]
+    services.backend.requests.clear()
+    proof = next(
+        (project / ".hoh" / "runs").glob(
+            "*/loops/loop-0001/adapter/artifacts/proof.txt"
+        )
+    )
+    proof.write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises((EvidenceBindingError, StateConflictError), match="sha256|evidence"):
+        services.orchestrator.resume()
+
+    assert services.backend.requests == []
+
+
+def test_resume_rejects_head_moved_after_completed_closure(tmp_path: Path) -> None:
+    project, services = orchestrator_fixture(tmp_path)
+    record_closed_loop = services.orchestrator._record_closed_loop
+    services.orchestrator._record_closed_loop = (  # type: ignore[method-assign]
+        lambda *args: (_ for _ in ()).throw(RuntimeError("crash after closure"))
+    )
+    with pytest.raises(RuntimeError, match="crash after closure"):
+        services.orchestrator.run(max_loops=1)
+    services.orchestrator._record_closed_loop = record_closed_loop  # type: ignore[method-assign]
+    services.backend.requests.clear()
+    run_git(
+        project,
+        "-c",
+        "user.name=external",
+        "-c",
+        "user.email=external@example.test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "unexpected post-closure commit",
+    )
+
+    with pytest.raises(StateConflictError, match="closure|evidence|HEAD"):
+        services.orchestrator.resume()
+
+    assert services.backend.requests == []
