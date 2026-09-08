@@ -1,10 +1,13 @@
 import hashlib
 import json
+import re
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from hoh.adapters import CommandAdapter
 from hoh.backends import BackendTimeout, FakeAgentBackend, FakeResponse
 from hoh.models import Role
 from hoh.orchestrator import ResumeError
@@ -93,6 +96,105 @@ def _assert_receipt_response_is_hash_bound(
     return path
 
 
+def _command_adapter_qa_response(request) -> dict[str, object]:
+    artifact_path = (
+        "release-adapter/checks/command-0001.json"
+        if "release-adapter/checks/command-0001.json" in request.prompt
+        else "adapter/checks/command-0001.json"
+    )
+    candidates = re.findall(
+        r'"candidate_sha":\s*"([0-9a-f]{40,64})"', request.prompt
+    )
+    trees = re.findall(
+        r'"artifact_tree_sha256":\s*"([0-9a-f]{64})"', request.prompt
+    )
+    artifact_match = re.search(
+        rf'"{re.escape(artifact_path)}":\s*"([0-9a-f]{{64}})"', request.prompt
+    )
+    assert candidates and trees and artifact_match is not None
+    return {
+        "iteration": 1,
+        "candidate_sha": candidates[-1],
+        "artifact_tree_sha256": trees[-1],
+        "qa_status": "pass",
+        "product_complete": False,
+        "verified_records": [
+            {
+                "claim_id": "claim-main",
+                "claim": "Main behavior works",
+                "observations": ["The retained command completed."],
+                "execution_records": [
+                    {
+                        "type": "command-result",
+                        "path": artifact_path,
+                        "sha256": artifact_match.group(1),
+                        "observation": "The command metadata records success.",
+                    }
+                ],
+                "preservation_requirement": "Keep the command check passing",
+            }
+        ],
+        "gap_records": [],
+        "planner_handoff": {
+            "preservation_constraints": ["Preserve claim-main"],
+            "update_targets": [],
+            "validation_requirements": ["Run the command check"],
+        },
+    }
+
+
+def _crash_after_command_full_release_qa(
+    tmp_path: Path,
+) -> tuple[Path, Services, CommandAdapter, Path, dict[str, object]]:
+    project = initialized_product(tmp_path)
+    backend = FakeAgentBackend(
+        [
+            FakeResponse(plan()),
+            FakeResponse(developer_response(), on_run=developer_change),
+            FakeResponse(_command_adapter_qa_response),
+            FakeResponse(_command_adapter_qa_response),
+        ]
+    )
+    adapter = CommandAdapter(
+        checks=((sys.executable, "-c", "print('stable command evidence')"),),
+        timeout_seconds=5,
+    )
+    services = build_services(project, backend, adapter)  # type: ignore[arg-type]
+    invoke_role = services.orchestrator._invoke_role
+
+    def invoke_then_crash(*args, **kwargs):
+        result = invoke_role(*args, **kwargs)
+        if args[3] is Role.QA and kwargs.get("invocation_kind") == "full-release":
+            raise RuntimeError("crash after command full-release QA invocation")
+        return result
+
+    services.orchestrator._invoke_role = invoke_then_crash  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="after command full-release QA"):
+        services.orchestrator.run(max_loops=1)
+    services.orchestrator._invoke_role = invoke_role  # type: ignore[method-assign]
+    run_dir = next((project / ".hoh" / "runs").iterdir())
+    receipt_path = (
+        run_dir
+        / "loops"
+        / "loop-0001"
+        / "receipts"
+        / "qa-full-release-attempt-01.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    return project, services, adapter, run_dir, receipt
+
+
+def _assert_project_descriptor(
+    project: Path, descriptor: object
+) -> tuple[Path, dict[str, object]]:
+    assert isinstance(descriptor, dict)
+    assert set(descriptor) == {"path", "sha256"}
+    path = project / str(descriptor["path"])
+    assert path.is_file()
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == descriptor["sha256"]
+    return path, json.loads(path.read_text(encoding="utf-8"))
+
+
 def test_resume_does_not_repeat_completed_developer(tmp_path: Path) -> None:
     project, services = crashed_after_candidate_fixture(tmp_path)
     original_candidate = services.git.head_sha()
@@ -148,6 +250,119 @@ def test_resume_replays_successful_full_release_qa_receipt_without_backend(
     gate = json.loads(gate_path.read_text(encoding="utf-8"))
     assert gate["invocation_id"] == receipt["invocation_id"]
     assert gate["response"] == response_descriptor
+
+
+def test_resume_replays_command_release_context_without_adapter_or_qa(
+    tmp_path: Path,
+) -> None:
+    project, services, adapter, run_dir, receipt = (
+        _crash_after_command_full_release_qa(tmp_path)
+    )
+    context_path, context = _assert_project_descriptor(project, receipt["context"])
+    assert context_path.name.startswith("release-context-")
+    assert context["artifacts"] == json.loads(
+        (run_dir / "loops" / "loop-0001" / "release-adapter-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )["artifacts"]
+    cited_path = (
+        run_dir
+        / "loops"
+        / "loop-0001"
+        / "release-adapter"
+        / "checks"
+        / "command-0001.json"
+    )
+    assert "release-adapter/checks/command-0001.json" in context["artifacts"]
+    cited_bytes = cited_path.read_bytes()
+    calls = {"check": 0, "collect": 0}
+    original_check = adapter.check
+    original_collect = adapter.collect
+
+    def counted_check(*args, **kwargs):
+        calls["check"] += 1
+        return original_check(*args, **kwargs)
+
+    def counted_collect(*args, **kwargs):
+        calls["collect"] += 1
+        return original_collect(*args, **kwargs)
+
+    adapter.check = counted_check  # type: ignore[method-assign]
+    adapter.collect = counted_collect  # type: ignore[method-assign]
+    services.backend.requests.clear()
+
+    result = services.orchestrator.resume()
+
+    assert result["terminal_status"] == "complete"
+    assert services.backend.requests == []
+    assert calls == {"check": 0, "collect": 0}
+    assert cited_path.read_bytes() == cited_bytes
+    gate = json.loads(
+        (run_dir / "loops" / "loop-0001" / "release-gate.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert gate["context"] == receipt["context"]
+    assert gate["response"] == receipt["response"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-context",
+        "tampered-context",
+        "mismatched-context",
+        "tampered-selected-artifact",
+    ],
+)
+def test_release_context_corruption_fails_before_adapter_or_qa(
+    tmp_path: Path, mutation: str
+) -> None:
+    project, services, adapter, run_dir, receipt = (
+        _crash_after_command_full_release_qa(tmp_path)
+    )
+    context_path, context = _assert_project_descriptor(project, receipt["context"])
+    receipt_path = (
+        run_dir
+        / "loops"
+        / "loop-0001"
+        / "receipts"
+        / "qa-full-release-attempt-01.json"
+    )
+    if mutation == "missing-context":
+        context_path.unlink()
+    elif mutation == "tampered-context":
+        context_path.write_text("{}\n", encoding="utf-8")
+    elif mutation == "mismatched-context":
+        receipt["context"] = receipt["response"]
+        receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    else:
+        artifact_relative = "release-adapter/checks/command-0001.json"
+        assert artifact_relative in context["artifacts"]
+        (
+            run_dir
+            / "loops"
+            / "loop-0001"
+            / "release-adapter"
+            / "checks"
+            / "command-0001.json"
+        ).write_text("{}\n", encoding="utf-8")
+    calls = 0
+
+    def unexpected_adapter_call(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("release adapter must not run before context validation")
+
+    adapter.check = unexpected_adapter_call  # type: ignore[method-assign]
+    adapter.collect = unexpected_adapter_call  # type: ignore[method-assign]
+    services.backend.requests.clear()
+
+    with pytest.raises(StateConflictError, match="release|context|artifact"):
+        services.orchestrator.resume()
+
+    assert calls == 0
+    assert services.backend.requests == []
 
 
 @pytest.mark.parametrize("invocation_kind", ["ordinary", "full-release"])

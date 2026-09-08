@@ -1134,6 +1134,7 @@ class HoHOrchestrator:
         response_descriptor: Mapping[str, object],
         *,
         invocation_kind: str = "ordinary",
+        context_descriptor: Mapping[str, object] | None = None,
     ) -> None:
         successful = [
             receipt
@@ -1145,15 +1146,30 @@ class HoHOrchestrator:
         durable_descriptor = (
             successful[0].get("response") if len(successful) == 1 else None
         )
+        durable_context = (
+            successful[0].get("context") if len(successful) == 1 else None
+        )
         if (
             len(successful) != 1
             or successful[0].get("invocation_id") != invocation_id
             or not isinstance(durable_descriptor, Mapping)
             or dict(durable_descriptor) != dict(response_descriptor)
+            or (
+                invocation_kind == "full-release"
+                and (
+                    not isinstance(durable_context, Mapping)
+                    or context_descriptor is None
+                    or dict(durable_context) != dict(context_descriptor)
+                )
+            )
+            or (
+                invocation_kind != "full-release"
+                and (durable_context is not None or context_descriptor is not None)
+            )
         ):
             raise StateConflictError(
                 "durable QA phase has a different successful invocation identity "
-                "or response descriptor"
+                "or response/context descriptor"
             )
 
     def _ensure_release_gate(
@@ -1228,86 +1244,124 @@ class HoHOrchestrator:
         check_id = f"{run_id}:loop-{loop_index:04d}:full-release-check"
         output = loop_dir / "release-adapter"
 
-        def release(
-            frozen: Path,
-        ) -> tuple[
-            dict[str, object],
-            dict[str, object],
-            dict[str, object],
-            dict[str, object],
-        ]:
-            bundle = self.adapter.check(AdapterContext(frozen, output), plan)
-            collected = self.adapter.collect(AdapterContext(frozen, output), bundle)
-            checks: dict[str, object] = {
-                "schema_version": 1,
-                "check_id": check_id,
-                "scope": "full_release",
-                "candidate_sha": candidate_sha,
-                "artifact_tree_sha256": artifact_tree_sha256,
-                "bundle": _bundle_document(bundle),
-            }
-            artifacts = self._adapter_manifest_artifacts(
-                loop_dir, output, bundle, collected
+        successful = [
+            receipt
+            for receipt in self._validated_role_attempts(
+                run_id, loop_index, loop_dir, Role.QA, "full-release"
             )
-            manifest: dict[str, object] = {
-                "schema_version": 1,
-                "adapter": bundle.adapter,
-                "status": bundle.status,
-                "candidate_sha": candidate_sha,
-                "artifact_tree_sha256": artifact_tree_sha256,
-                "deterministic_check_id": check_id,
-                "scope": "full_release",
-                "artifacts": artifacts,
-                "diagnostics": [],
-            }
-            checks_path = loop_dir / "release-checks.json"
-            manifest_path = loop_dir / "release-adapter-manifest.json"
-            atomic_write_json(checks_path, checks)
-            atomic_write_json(manifest_path, manifest)
-            context_checks = {
-                "scope": "full_release",
-                "candidate_sha": candidate_sha,
-                "artifact_tree_sha256": artifact_tree_sha256,
-                "deterministic_check_id": check_id,
-                "ordinary_evidence": ordinary_evidence,
-                "checks": checks,
-                "adapter_manifest": manifest,
-            }
-            prompt = (
-                "# FULL RELEASE QA / E2E GATE\n\n"
-                "This is a distinct fresh full-release invocation against the same frozen "
-                "candidate. Re-run independent end-to-end acceptance from the retained "
-                "full-release check records; do not reuse the ordinary loop verdict.\n\n"
-                + self.prompt_renderer.render(
-                    Role.QA,
-                    self._prompt_context(
-                        workspace=frozen,
-                        previous=previous,
-                        current_plan=plan,
-                        checks=context_checks,
-                    ),
-                    skills,
-                )
-            )
-            raw, receipt = self._invoke_role(
+            if receipt.get("outcome") == "success"
+        ]
+        if successful:
+            qa_receipt = successful[0]
+            context_descriptor = _required_mapping(qa_receipt, "context")
+            context, checks, manifest, _ = self._validated_release_invocation_context(
                 run_id,
                 loop_index,
                 loop_dir,
-                Role.QA,
-                prompt,
-                frozen,
-                skills,
-                invocation_kind="full-release",
-                read_only_workspace=frozen,
-                response_validator=lambda response: self._validate_role_semantics(
-                    Role.QA, response, loop_index
-                ),
+                context_descriptor,
+                candidate,
             )
-            return checks, manifest, raw, receipt
+            raw = self._validated_successful_qa_response(
+                loop_index, loop_dir, qa_receipt, "full-release"
+            )
+        else:
 
-        checks, manifest, raw, qa_receipt = self._with_frozen_candidate(
-            run_id, loop_index, candidate_sha, release
-        )
+            def release(
+                frozen: Path,
+            ) -> tuple[dict[str, object], dict[str, object]]:
+                bundle = self.adapter.check(AdapterContext(frozen, output), plan)
+                collected = self.adapter.collect(
+                    AdapterContext(frozen, output), bundle
+                )
+                fresh_checks: dict[str, object] = {
+                    "schema_version": 1,
+                    "check_id": check_id,
+                    "scope": "full_release",
+                    "candidate_sha": candidate_sha,
+                    "artifact_tree_sha256": artifact_tree_sha256,
+                    "bundle": _bundle_document(bundle),
+                }
+                artifacts = self._adapter_manifest_artifacts(
+                    loop_dir, output, bundle, collected
+                )
+                fresh_manifest: dict[str, object] = {
+                    "schema_version": 1,
+                    "adapter": bundle.adapter,
+                    "status": bundle.status,
+                    "candidate_sha": candidate_sha,
+                    "artifact_tree_sha256": artifact_tree_sha256,
+                    "deterministic_check_id": check_id,
+                    "scope": "full_release",
+                    "artifacts": artifacts,
+                    "diagnostics": [],
+                }
+                checks_path = loop_dir / "release-checks.json"
+                manifest_path = loop_dir / "release-adapter-manifest.json"
+                atomic_write_json(checks_path, fresh_checks)
+                atomic_write_json(manifest_path, fresh_manifest)
+                fresh_context_descriptor = (
+                    self._persist_release_invocation_context(
+                        run_id,
+                        loop_index,
+                        loop_dir,
+                        candidate,
+                        check_id,
+                    )
+                )
+                context_checks = {
+                    "scope": "full_release",
+                    "candidate_sha": candidate_sha,
+                    "artifact_tree_sha256": artifact_tree_sha256,
+                    "deterministic_check_id": check_id,
+                    "ordinary_evidence": ordinary_evidence,
+                    "checks": fresh_checks,
+                    "adapter_manifest": fresh_manifest,
+                }
+                prompt = (
+                    "# FULL RELEASE QA / E2E GATE\n\n"
+                    "This is a distinct fresh full-release invocation against the same "
+                    "frozen candidate. Re-run independent end-to-end acceptance from "
+                    "the retained full-release check records; do not reuse the ordinary "
+                    "loop verdict.\n\n"
+                    + self.prompt_renderer.render(
+                        Role.QA,
+                        self._prompt_context(
+                            workspace=frozen,
+                            previous=previous,
+                            current_plan=plan,
+                            checks=context_checks,
+                        ),
+                        skills,
+                    )
+                )
+                return self._invoke_role(
+                    run_id,
+                    loop_index,
+                    loop_dir,
+                    Role.QA,
+                    prompt,
+                    frozen,
+                    skills,
+                    invocation_kind="full-release",
+                    read_only_workspace=frozen,
+                    response_validator=lambda response: self._validate_role_semantics(
+                        Role.QA, response, loop_index
+                    ),
+                    invocation_context_descriptor=fresh_context_descriptor,
+                )
+
+            raw, qa_receipt = self._with_frozen_candidate(
+                run_id, loop_index, candidate_sha, release
+            )
+            context_descriptor = _required_mapping(qa_receipt, "context")
+            context, checks, manifest, _ = self._validated_release_invocation_context(
+                run_id,
+                loop_index,
+                loop_dir,
+                context_descriptor,
+                candidate,
+            )
+
         invocation_id = _required_text(qa_receipt, "invocation_id")
         response_descriptor = _required_mapping(qa_receipt, "response")
         normalizer = EvidenceNormalizer(
@@ -1326,8 +1380,6 @@ class HoHOrchestrator:
                 "successful full-release QA receipt has a different response descriptor"
             )
         atomic_write_json(release_evidence_path, normalized)
-        checks_path = loop_dir / "release-checks.json"
-        manifest_path = loop_dir / "release-adapter-manifest.json"
         checks_bundle = _required_mapping(checks, "bundle")
         deterministic_passed = checks_bundle.get("status") == "pass"
         release_qa_passed = (
@@ -1344,11 +1396,277 @@ class HoHOrchestrator:
             "deterministic_checks_passed": deterministic_passed,
             "check_id": check_id,
             "deterministic_checks_candidate_sha": candidate_sha,
-            "checks": self._descriptor(checks_path),
-            "manifest": self._descriptor(manifest_path),
+            "checks": _required_mapping(context, "checks"),
+            "manifest": _required_mapping(context, "manifest"),
+            "context": dict(context_descriptor),
             "response": response_descriptor,
             "evidence": self._descriptor(release_evidence_path),
         }
+
+    def _persist_release_invocation_context(
+        self,
+        run_id: str,
+        loop_index: int,
+        loop_dir: Path,
+        candidate: Mapping[str, object],
+        check_id: str,
+    ) -> dict[str, str]:
+        """Persist the exact release inputs before a successful receipt can exist."""
+
+        checks_path = loop_dir / "release-checks.json"
+        manifest_path = loop_dir / "release-adapter-manifest.json"
+        evidence_path = loop_dir / "evidence.json"
+        try:
+            checks = _read_json(
+                self._required_regular_evidence_path(checks_path, loop_dir)
+            )
+            manifest = _read_json(
+                self._required_regular_evidence_path(manifest_path, loop_dir)
+            )
+            self._required_regular_evidence_path(evidence_path, loop_dir)
+        except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+            if isinstance(error, StateConflictError):
+                raise
+            raise StateConflictError(
+                "full-release invocation context inputs are invalid"
+            ) from error
+        context: dict[str, object] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "loop_index": loop_index,
+            "scope": "full_release",
+            "candidate_sha": _required_text(candidate, "candidate_sha"),
+            "artifact_tree_sha256": _required_text(
+                candidate, "artifact_tree_sha256"
+            ),
+            "check_id": check_id,
+            "ordinary_evidence": self._descriptor(evidence_path),
+            "checks": self._descriptor(checks_path),
+            "manifest": self._descriptor(manifest_path),
+            "artifacts": _required_mapping(manifest, "artifacts"),
+        }
+        identity = _canonical_json_sha256(context)
+        context_path = loop_dir / f"release-context-{identity[:32]}.json"
+        if context_path.exists() or context_path.is_symlink():
+            try:
+                retained_path = self._required_regular_evidence_path(
+                    context_path, loop_dir
+                )
+                retained = _read_json(retained_path)
+            except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+                raise StateConflictError(
+                    "durable release invocation context is malformed"
+                ) from error
+            if retained != context:
+                raise StateConflictError(
+                    "durable release invocation context is immutable"
+                )
+        else:
+            atomic_write_json(context_path, context)
+        descriptor = self._descriptor(context_path)
+        self._validated_release_invocation_context(
+            run_id, loop_index, loop_dir, descriptor, candidate
+        )
+        return descriptor
+
+    def _validated_release_invocation_context(
+        self,
+        run_id: str,
+        loop_index: int,
+        loop_dir: Path,
+        descriptor: Mapping[str, object],
+        candidate: Mapping[str, object] | None = None,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object], Path]:
+        """Validate a success receipt's immutable release inputs without rerunning them."""
+
+        loaded_candidate = candidate is None
+        if candidate is None:
+            try:
+                candidate_path = self._required_regular_evidence_path(
+                    loop_dir / "candidate.json", loop_dir
+                )
+                candidate = _read_json(candidate_path)
+            except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+                raise StateConflictError(
+                    "durable release invocation candidate is invalid"
+                ) from error
+        candidate_loop_index = candidate.get("loop_index")
+        if (
+            candidate.get("run_id") != run_id
+            or isinstance(candidate_loop_index, bool)
+            or not isinstance(candidate_loop_index, int)
+            or candidate_loop_index != loop_index
+        ):
+            raise StateConflictError(
+                "durable release invocation candidate identity is malformed"
+            )
+        if loaded_candidate:
+            try:
+                self._validate_candidate(candidate)
+            except (GitError, StateError) as error:
+                raise StateConflictError(
+                    "durable release invocation candidate does not match Git"
+                ) from error
+
+        if set(descriptor) != {"path", "sha256"}:
+            raise StateConflictError(
+                "durable release invocation context descriptor is malformed"
+            )
+        relative = descriptor.get("path")
+        expected_hash = descriptor.get("sha256")
+        if (
+            not isinstance(relative, str)
+            or not isinstance(expected_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+        ):
+            raise StateConflictError(
+                "durable release invocation context descriptor is malformed"
+            )
+        filename_match = re.fullmatch(
+            r"release-context-([0-9a-f]{32})\.json",
+            PurePosixPath(relative).name,
+        )
+        if filename_match is None:
+            raise StateConflictError(
+                "durable release invocation context path is malformed"
+            )
+        context_path = loop_dir / PurePosixPath(relative).name
+        try:
+            retained_path = self._required_regular_evidence_path(
+                context_path, loop_dir
+            )
+            expected_relative = self._project_relative(retained_path)
+            if relative != expected_relative:
+                raise StateConflictError(
+                    "durable release invocation context path is not canonical"
+                )
+            if _file_sha256(retained_path) != expected_hash:
+                raise StateConflictError(
+                    "durable release invocation context hash does not match"
+                )
+            context = _read_json(retained_path)
+        except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+            raise StateConflictError(
+                "durable release invocation context artifact is invalid"
+            ) from error
+        allowed = {
+            "schema_version",
+            "run_id",
+            "loop_index",
+            "scope",
+            "candidate_sha",
+            "artifact_tree_sha256",
+            "check_id",
+            "ordinary_evidence",
+            "checks",
+            "manifest",
+            "artifacts",
+        }
+        if (
+            set(context) != allowed
+            or isinstance(context.get("schema_version"), bool)
+            or context.get("schema_version") != 1
+            or context.get("run_id") != run_id
+            or isinstance(context.get("loop_index"), bool)
+            or context.get("loop_index") != loop_index
+            or context.get("scope") != "full_release"
+            or not _canonical_json_sha256(context).startswith(filename_match.group(1))
+        ):
+            raise StateConflictError(
+                "durable release invocation context identity is malformed"
+            )
+        self._require_candidate_binding(context, candidate)
+
+        checks = self._validated_release_context_document(
+            context,
+            "checks",
+            loop_dir / "release-checks.json",
+            loop_dir,
+        )
+        manifest = self._validated_release_context_document(
+            context,
+            "manifest",
+            loop_dir / "release-adapter-manifest.json",
+            loop_dir,
+        )
+        ordinary_evidence = self._validated_release_context_document(
+            context,
+            "ordinary_evidence",
+            loop_dir / "evidence.json",
+            loop_dir,
+        )
+        self._require_candidate_binding(checks, candidate)
+        self._require_candidate_binding(manifest, candidate)
+        self._require_candidate_binding(ordinary_evidence, candidate)
+        check_id = context.get("check_id")
+        if (
+            not isinstance(check_id, str)
+            or not check_id
+            or checks.get("scope") != "full_release"
+            or checks.get("check_id") != check_id
+            or manifest.get("scope") != "full_release"
+            or manifest.get("deterministic_check_id") != check_id
+        ):
+            raise StateConflictError(
+                "durable release invocation context check identity is malformed"
+            )
+        artifacts = context.get("artifacts")
+        manifest_artifacts = manifest.get("artifacts")
+        if (
+            not isinstance(artifacts, Mapping)
+            or not isinstance(manifest_artifacts, Mapping)
+            or dict(artifacts) != dict(manifest_artifacts)
+        ):
+            raise StateConflictError(
+                "durable release invocation context artifact set is malformed"
+            )
+        self._validated_manifest_artifact_paths(loop_dir, manifest)
+        return context, checks, manifest, retained_path
+
+    def _validated_release_context_document(
+        self,
+        context: Mapping[str, object],
+        field: str,
+        expected_path: Path,
+        loop_dir: Path,
+    ) -> dict[str, object]:
+        descriptor = context.get(field)
+        if not isinstance(descriptor, Mapping) or set(descriptor) != {
+            "path",
+            "sha256",
+        }:
+            raise StateConflictError(
+                f"durable release invocation context {field} descriptor is malformed"
+            )
+        relative = descriptor.get("path")
+        expected_hash = descriptor.get("sha256")
+        if (
+            not isinstance(relative, str)
+            or not isinstance(expected_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+        ):
+            raise StateConflictError(
+                f"durable release invocation context {field} descriptor is malformed"
+            )
+        try:
+            retained_path = self._required_regular_evidence_path(
+                expected_path, loop_dir
+            )
+            if relative != self._project_relative(retained_path):
+                raise StateConflictError(
+                    f"durable release invocation context {field} path is not canonical"
+                )
+            if _file_sha256(retained_path) != expected_hash:
+                raise StateConflictError(
+                    f"durable release invocation context {field} hash does not match"
+                )
+            return _read_json(retained_path)
+        except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+            if isinstance(error, StateConflictError):
+                raise
+            raise StateConflictError(
+                f"durable release invocation context {field} artifact is invalid"
+            ) from error
 
     def _validate_release_gate(
         self,
@@ -1365,6 +1683,7 @@ class HoHOrchestrator:
             raise StateConflictError("durable release gate has the wrong scope")
         invocation_id = _required_text(release_gate, "invocation_id")
         response_descriptor = _required_mapping(release_gate, "response")
+        context_descriptor = _required_mapping(release_gate, "context")
         self._validate_qa_invocation(
             _required_text(candidate, "run_id"),
             _required_positive_int(candidate, "loop_index"),
@@ -1372,6 +1691,7 @@ class HoHOrchestrator:
             invocation_id,
             response_descriptor,
             invocation_kind="full-release",
+            context_descriptor=context_descriptor,
         )
         check_id = _required_text(release_gate, "check_id")
         if release_gate.get("deterministic_checks_candidate_sha") != candidate.get(
@@ -1379,8 +1699,22 @@ class HoHOrchestrator:
         ):
             raise StateConflictError("durable release checks target a different candidate")
 
-        checks = self._read_descriptor(release_gate, "checks")
-        manifest = self._read_descriptor(release_gate, "manifest")
+        context, checks, manifest, _ = self._validated_release_invocation_context(
+            _required_text(candidate, "run_id"),
+            _required_positive_int(candidate, "loop_index"),
+            loop_dir,
+            context_descriptor,
+            candidate,
+        )
+        if (
+            _required_mapping(release_gate, "checks")
+            != _required_mapping(context, "checks")
+            or _required_mapping(release_gate, "manifest")
+            != _required_mapping(context, "manifest")
+        ):
+            raise StateConflictError(
+                "durable release gate has a different invocation context"
+            )
         response = self._read_descriptor(release_gate, "response")
         evidence = self._read_descriptor(release_gate, "evidence")
         for artifact in (checks, manifest, evidence):
@@ -1911,7 +2245,17 @@ class HoHOrchestrator:
         protected_paths: tuple[str, ...] | None = None,
         read_only_workspace: Path | None = None,
         response_validator: Callable[[Mapping[str, object]], None] | None = None,
+        invocation_context_descriptor: Mapping[str, object] | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
+        requires_invocation_context = (
+            role is Role.QA and invocation_kind == "full-release"
+        )
+        if requires_invocation_context != (
+            invocation_context_descriptor is not None
+        ):
+            raise AssertionError(
+                "only full-release QA requires an invocation context descriptor"
+            )
         maximum_attempts = 1 + min(self.config.max_role_retries, 1)
         durable_attempts = self._validated_role_attempts(
             run_id, loop_index, loop_dir, role, invocation_kind
@@ -1925,6 +2269,14 @@ class HoHOrchestrator:
             ]
             if successful:
                 receipt = successful[0]
+                if (
+                    invocation_kind == "full-release"
+                    and _required_mapping(receipt, "context")
+                    != dict(invocation_context_descriptor or {})
+                ):
+                    raise StateConflictError(
+                        "durable full-release QA receipt has a different context"
+                    )
                 response = self._validated_successful_qa_response(
                     loop_index,
                     loop_dir,
@@ -1975,6 +2327,7 @@ class HoHOrchestrator:
                     protected_snapshot=protected_snapshot,
                     read_only_snapshot=read_only_snapshot,
                     response_validator=response_validator,
+                    invocation_context_descriptor=invocation_context_descriptor,
                 )
             except _REPAIRABLE_ROLE_ERRORS as error:
                 attempts_used = attempt
@@ -1999,6 +2352,7 @@ class HoHOrchestrator:
         protected_snapshot: Mapping[str, str] | None = None,
         read_only_snapshot: tuple[Path, str] | None = None,
         response_validator: Callable[[Mapping[str, object]], None] | None = None,
+        invocation_context_descriptor: Mapping[str, object] | None = None,
     ) -> tuple[dict[str, object], dict[str, object]]:
         invocation_id = (
             f"{run_id}:loop-{loop_index:04d}:{role.value}:{invocation_kind}:"
@@ -2124,6 +2478,7 @@ class HoHOrchestrator:
             outcome="success",
             error=None,
             response_descriptor=response_descriptor,
+            context_descriptor=invocation_context_descriptor,
         )
         atomic_write_json(receipt_path, receipt)
         return dict(result.response), receipt
@@ -2341,6 +2696,7 @@ class HoHOrchestrator:
         outcome: str,
         error: BaseException | None,
         response_descriptor: Mapping[str, object] | None = None,
+        context_descriptor: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         usage = asdict(result.usage) if result is not None else asdict(_empty_usage())
         receipt: dict[str, object] = {
@@ -2385,9 +2741,23 @@ class HoHOrchestrator:
                     "a successful QA receipt requires a durable response descriptor"
                 )
             receipt["response"] = dict(response_descriptor)
+            if invocation_kind == "full-release":
+                if context_descriptor is None:
+                    raise AssertionError(
+                        "a successful full-release QA receipt requires a durable context"
+                    )
+                receipt["context"] = dict(context_descriptor)
+            elif context_descriptor is not None:
+                raise AssertionError(
+                    "ordinary QA receipts must not bind a release context"
+                )
         elif response_descriptor is not None:
             raise AssertionError(
                 "only a successful QA receipt may bind a response descriptor"
+            )
+        elif context_descriptor is not None:
+            raise AssertionError(
+                "only a successful full-release QA receipt may bind a context"
             )
         return receipt
 
@@ -3001,11 +3371,33 @@ class HoHOrchestrator:
                     self._validated_successful_qa_response(
                         loop_index, loop_dir, receipt, kind
                     )
+                    if kind == "full-release":
+                        context_descriptor = receipt.get("context")
+                        if not isinstance(context_descriptor, Mapping):
+                            raise StateConflictError(
+                                "durable successful full-release QA receipt has no context"
+                            )
+                        self._validated_release_invocation_context(
+                            run_id,
+                            loop_index,
+                            loop_dir,
+                            context_descriptor,
+                        )
+                    elif "context" in receipt:
+                        raise StateConflictError(
+                            "durable ordinary QA receipt has an ambiguous context"
+                        )
                     successful_qa_groups.add(qa_group)
-            else:
-                if role_value == Role.QA.value and "response" in receipt:
+                elif "response" in receipt or "context" in receipt:
                     raise StateConflictError(
-                        "durable failed QA receipt has an ambiguous response"
+                        "durable non-QA receipt has ambiguous QA artifacts"
+                    )
+            else:
+                if role_value == Role.QA.value and (
+                    "response" in receipt or "context" in receipt
+                ):
+                    raise StateConflictError(
+                        "durable failed QA receipt has ambiguous QA artifacts"
                     )
                 error = receipt.get("error")
                 if (
@@ -3070,7 +3462,15 @@ class HoHOrchestrator:
 
         release_gate = _optional_mapping(qa.get("release_gate"))
         if release_gate:
-            release_manifest = self._read_descriptor(release_gate, "manifest")
+            context_descriptor = _required_mapping(release_gate, "context")
+            _, _, release_manifest, context_path = (
+                self._validated_release_invocation_context(
+                    run_id,
+                    loop_index,
+                    loop_dir,
+                    context_descriptor,
+                )
+            )
             for name in (
                 "release-gate.json",
                 "release-checks.json",
@@ -3081,6 +3481,7 @@ class HoHOrchestrator:
                 selected.append(
                     self._required_regular_evidence_path(loop_dir / name, loop_dir)
                 )
+            selected.append(context_path)
             selected.extend(
                 self._validated_manifest_artifact_paths(loop_dir, release_manifest)
             )
@@ -3657,6 +4058,22 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(64 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_json_sha256(document: Mapping[str, object]) -> str:
+    try:
+        canonical = json.dumps(
+            document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise StateConflictError(
+            "durable release invocation context is not canonical JSON"
+        ) from error
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _read_json(path: Path) -> dict[str, object]:

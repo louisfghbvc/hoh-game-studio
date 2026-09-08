@@ -177,6 +177,31 @@ Valid ordinary-check example:
 
 A release result is not interchangeable with the ordinary candidate check.
 
+Before full-release QA starts, the host atomically writes an immutable
+`release-context-<hash-prefix>.json`. Its filename contains the first 32 hex
+characters of the canonical context hash, while its receipt descriptor binds
+the complete file SHA-256. The document has these fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version` | integer, currently `1` | Release invocation context format. |
+| `run_id` | string | Owning run identity. |
+| `loop_index` | positive integer | Owning loop. |
+| `scope` | `full_release` | Prevents ordinary QA substitution. |
+| `candidate_sha` | Git commit SHA | Candidate checked and assessed. |
+| `artifact_tree_sha256` | 64-character hash | Candidate tree binding. |
+| `check_id` | string | Full-release deterministic check identity. |
+| `ordinary_evidence` | descriptor object | Exact normalized ordinary evidence used as release context. |
+| `checks` | descriptor object | Exact `release-checks.json` bytes used by QA. |
+| `manifest` | descriptor object | Exact `release-adapter-manifest.json` bytes used by QA. |
+| `artifacts` | object from normalized path to SHA-256 | Complete selected artifact set, exactly equal to the release manifest. |
+
+The context, its descriptors, and every manifest artifact are validated before
+a successful full-release receipt is replayed. A valid success receipt without
+`release-gate.json` therefore reuses its retained checks and artifacts without
+rerunning either the adapter or QA. Missing, mismatched, or tampered context
+fails closed.
+
 The QA phase journal binds descriptors for both `qa-response.json` and the
 normalized `evidence.json`, plus the ordinary QA invocation ID. The host
 first atomically persists and hashes the raw response, then writes the successful
@@ -198,6 +223,7 @@ every field below:
 | `deterministic_checks_candidate_sha` | Git commit SHA | Explicit candidate binding for the checks. |
 | `checks` | descriptor object | Project-relative `path` and file `sha256` for `release-checks.json`. |
 | `manifest` | descriptor object | Project-relative `path` and file `sha256` for `release-adapter-manifest.json`. |
+| `context` | descriptor object | Project-relative `path` and file `sha256` for the immutable release invocation context. |
 | `response` | descriptor object | Project-relative `path` and file `sha256` for `release-qa-response.json`. |
 | `evidence` | descriptor object | Project-relative `path` and file `sha256` for `release-evidence.json`. |
 
@@ -387,17 +413,21 @@ not by itself prove the run complete.
 | `return_code` | integer or null | Backend process return code, null when no result exists. |
 | `executable_version` | string | Captured Codex executable version, or `unknown`. |
 | `response` | descriptor object, successful QA only | Project-relative `path` and file `sha256` for the immutable ordinary or full-release raw QA response. |
+| `context` | descriptor object, successful full-release QA only | Immutable release checks, manifest, and selected-artifact binding that existed before the receipt. |
 | `error` | object, optional | Present for non-success outcomes; contains `type` and `message` strings. |
 
 Each `skills[]` object has `skill_id`, `version`, and content `sha256`. Each
 `usage` object has `input_tokens`, `cached_input_tokens`, `output_tokens`, and
 `reasoning_output_tokens`, all nonnegative integers.
 
-A successful QA receipt is durable only after its response artifact. If a crash
-lands before the QA phase journal or `release-gate.json`, resume validates the
-receipt identity, descriptor, hash, schema, candidate/tree binding, and cited
-artifact hashes, then replays that exact response without another QA invocation.
-Missing, mismatched, or tampered response artifacts fail closed.
+A successful QA receipt is durable only after its response artifact. A
+successful full-release QA receipt is additionally durable only after its
+release context. If a crash lands before the QA phase journal or
+`release-gate.json`, resume validates the receipt identity, descriptors, hashes,
+schema, candidate/tree binding, and cited artifact hashes, then replays that
+exact response without another invocation. Full-release replay also avoids
+rerunning its adapter. Missing, mismatched, or tampered response/context
+artifacts fail closed.
 
 Valid successful-attempt example:
 
