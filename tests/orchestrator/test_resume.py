@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -942,7 +942,7 @@ def test_elapsed_time_rebases_once_when_a_later_loop_resumes(tmp_path: Path) -> 
 
     class Clock:
         elapsed = 0.0
-        epoch = datetime(2026, 1, 1, tzinfo=UTC)
+        epoch = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
         def monotonic(self) -> float:
             return self.elapsed

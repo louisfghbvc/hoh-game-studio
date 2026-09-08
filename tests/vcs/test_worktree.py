@@ -75,6 +75,40 @@ def test_create_can_freeze_an_explicit_older_candidate(tmp_path: Path) -> None:
         worktree.remove()
 
 
+def test_create_excludes_long_tracked_host_state_when_repo_disables_longpaths(
+    tmp_path: Path,
+) -> None:
+    """QA needs the product tree, not recursively nested host evidence."""
+
+    repo = initialized_repo(tmp_path)
+    evidence_parent = repo / ".hoh" / "runs" / "run-a" / "loops" / "loop-0001"
+    filename_length = 250 - len(str(evidence_parent)) - 1 - len(".json")
+    assert filename_length > 0
+    evidence = evidence_parent / ("r" * filename_length + ".json")
+    assert len(str(evidence)) == 250
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text("{}\n", encoding="utf-8")
+    run_git(repo, "-c", "core.longpaths=true", "add", ".hoh")
+    run_git(
+        repo,
+        "-c",
+        "core.longpaths=true",
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-m",
+        "retain evidence",
+    )
+    run_git(repo, "config", "core.longpaths", "false")
+    worktree_path = repo / ".hoh" / "tmp" / "qa-long"
+
+    with QaWorktree(GitService(repo), worktree_path) as frozen:
+        assert (frozen / "product.txt").read_text(encoding="utf-8") == "original"
+        assert not (frozen / ".hoh").exists()
+
+
 def test_remove_refuses_a_path_outside_the_host_temp_root(tmp_path: Path) -> None:
     repo = initialized_repo(tmp_path)
     outside = tmp_path / "not-host-owned"

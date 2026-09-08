@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 import threading
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Mapping, Sequence
 
@@ -242,7 +242,7 @@ class CommandAdapter:
 
 
 def _utc_now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _drain_pipe(stream: IO[str], chunks: list[str]) -> None:

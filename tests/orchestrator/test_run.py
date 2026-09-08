@@ -1,7 +1,7 @@
 import asyncio
 import json
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -42,7 +42,7 @@ from tests.orchestrator.helpers import (
 class MutableClock:
     def __init__(self) -> None:
         self.elapsed = 0.0
-        self.epoch = datetime(2026, 1, 1, tzinfo=UTC)
+        self.epoch = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
     def monotonic(self) -> float:
         return self.elapsed

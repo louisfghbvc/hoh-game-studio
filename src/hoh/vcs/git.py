@@ -407,7 +407,21 @@ class GitService:
         ).strip()
 
     def _add_detached_worktree(self, path: Path, candidate_sha: str) -> None:
-        self._run(("worktree", "add", "--detach", str(path), candidate_sha))
+        self._run(
+            ("worktree", "add", "--detach", "--no-checkout", str(path), candidate_sha)
+        )
+        try:
+            self._run(
+                ("sparse-checkout", "set", "--no-cone", "/*", "!/.hoh/"),
+                cwd=path,
+            )
+            self._run(("checkout", "--detach", candidate_sha), cwd=path)
+        except GitError:
+            try:
+                self._remove_worktree(path)
+            finally:
+                self._prune_worktrees()
+            raise
 
     def _remove_worktree(self, path: Path) -> None:
         self._run(("worktree", "remove", "--force", str(path)))

@@ -130,7 +130,7 @@ def test_collect_copies_only_configured_artifacts_and_hashes_them(tmp_path: Path
     """Copying unconfigured files or omitting the hash must make this fail."""
     evidence = tmp_path / "evidence"
     evidence.mkdir()
-    (evidence / "telemetry.jsonl").write_text("event\n", encoding="utf-8")
+    (evidence / "telemetry.jsonl").write_bytes(b"event\n")
     (evidence / "private.txt").write_text("do not collect", encoding="utf-8")
     context = _context(tmp_path)
     adapter = CommandAdapter(artifact_globs=("evidence/*.jsonl",))
@@ -139,7 +139,7 @@ def test_collect_copies_only_configured_artifacts_and_hashes_them(tmp_path: Path
 
     assert artifacts == {
         "artifacts/evidence/telemetry.jsonl": (
-            "627f0173e2a3c6a8b2019573d8f9d1ddb9cc4b650087e7cb43af28e1c23763ba"
+            "d8073d788ee641f2f54333c3246b08951f721c3f8090cdcb1f0fa9e80eaef504"
         )
     }
     assert (context.output / "artifacts" / "evidence" / "telemetry.jsonl").is_file()
