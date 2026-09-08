@@ -631,8 +631,18 @@ external structured failure record agree and the failure has
 `"repairable": true`; for a safe run ID, the report guidance is
 `hoh resume --run-id <run-id>`. It is distinct from `running` (an in-progress
 run without a terminal closure), `cancelled` (a user-cancelled, non-resumable
-outcome), `blocked` (an unrecoverable failure), `complete` (the release gate
-passed), and `budget_exhausted` (a policy-limit closure).
+outcome), `blocked` (a non-resumable failure or bounded policy stop described
+below), `complete` (the release gate passed), and `budget_exhausted` (a
+resource/loop-budget closure).
+
+`blocked` has two classes of source. It records either a validated
+unrecoverable `infrastructure` or `protocol` failure, or a bounded policy stop
+after a configured streak threshold is reached. With the defaults, the policy
+stops after three consecutive loops in which at least one same blocker
+persists, or three consecutive loops with no measurable evidence progress.
+`blocked` does not mean `budget_exhausted` (a token, elapsed-time, or loop
+ceiling); it is not a user cancellation (`cancelled`) and not a repairable
+failure state (`resumable`).
 
 Each `usage_by_role.<role>` object has `input_tokens`,
 `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, and
