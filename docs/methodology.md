@@ -15,7 +15,7 @@ choices.
 | Concept | Methodological role | This implementation |
 |---|---|---|
 | Artifact state | The evolving product carries forward across development loops. | Production files live in a separate Git repository. Each Developer increment becomes a candidate commit on `hoh/run-<run-id>`; later loops start from retained repository state rather than a generated narrative. |
-| Evidence state | Evaluation results carry forward alongside the artifact so future work is grounded in observed behavior. | Candidate-bound `checks.json`, `adapter-manifest.json`, normalized `evidence.json`, receipts, and the issue ledger are retained under `.hoh/runs/`. The next Planner receives normalized prior evidence and stable issue identities. |
+| Evidence state | Evaluation results carry forward alongside the artifact so future work is grounded in observed behavior. | Candidate-bound `checks.json`, `adapter-manifest.json`, normalized `evidence.json`, receipts, and other per-run records are retained under `.hoh/runs/<run-id>/`. The issue ledger is separate product-level state at `.hoh/issue-ledger.json`, replay-validated from retained evidence. The next Planner receives normalized prior evidence and stable issue identities. |
 | Planner | Select the next coherent improvement from the current product and evaluation state. | A fresh read-only Codex invocation receives the PRD, requirement registry, project summary, prior evidence, issue ledger, and selected skills. Its schema allows one to three priorities and forbids a completion verdict. |
 | Developer | Change the artifact in pursuit of the bounded plan. | A fresh workspace-write invocation is the only agent allowed to edit production files. The host snapshots `.hoh` and `.git`, rejects protected-path changes, derives changed paths from Git, and commits the candidate itself. |
 | QA Tester | Independently assess what the current artifact actually demonstrates. | A fresh read-only invocation inspects a detached worktree at one candidate SHA plus host-retained deterministic check records. A verified claim needs a cited execution record; missing proof is a gap or insufficient evidence, not success. |
@@ -34,6 +34,12 @@ The two state streams remain distinct:
   issue-ledger transition history, invocation receipts, and stop decision. It
   describes what was checked about a specific artifact; it is not allowed to
   mutate or stand in for that artifact.
+
+The paths reflect the same boundary: product-level `.hoh/issue-ledger.json`
+sits directly under `.hoh`, while immutable evidence for an individual run is
+stored under `.hoh/runs/<run-id>/`. Authoritative inspection replays retained
+per-run evidence and verifies the product-level ledger instead of treating the
+ledger as a per-run file.
 
 The next Planner sees both streams through bounded public context. It can
 preserve verified behavior, prioritize open or regressed issues, and request

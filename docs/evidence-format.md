@@ -607,7 +607,7 @@ replay. The base status has every field below:
 | Field | Type | Meaning |
 |---|---|---|
 | `run_id` | string or null | Durable run identity. |
-| `terminal_status` | string or null | `complete`, `blocked`, `budget_exhausted`, `cancelled`, or `running` as reconstructed. |
+| `terminal_status` | string or null | Authoritatively reconstructed as `running`, `resumable`, `complete`, `blocked`, `budget_exhausted`, or `cancelled`; null only when no decision record is supplied to the base reporter. |
 | `reason` | string or null | Host stop/continue reason. |
 | `start_sha` | string or null | Starting product commit. |
 | `current_candidate` | string or null | Latest phase-bound candidate commit. |
@@ -624,6 +624,15 @@ replay. The base status has every field below:
 | `failure_category` | `infrastructure`, `protocol`, or null | Terminal classified failure when present. |
 | `skills` | array of skill receipts | Unique `skill_id`, `version`, and `sha256` identities observed in receipts. |
 | `guidance` | string | Exact safe `hoh resume --run-id ...`, candidate `git merge ...`, or manual-action text. |
+
+`resumable` denotes a validated, repairable failure that interrupted the run.
+Authoritative inspection reconstructs it only when the durable aggregate and
+external structured failure record agree and the failure has
+`"repairable": true`; for a safe run ID, the report guidance is
+`hoh resume --run-id <run-id>`. It is distinct from `running` (an in-progress
+run without a terminal closure), `cancelled` (a user-cancelled, non-resumable
+outcome), `blocked` (an unrecoverable failure), `complete` (the release gate
+passed), and `budget_exhausted` (a policy-limit closure).
 
 Each `usage_by_role.<role>` object has `input_tokens`,
 `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, and
