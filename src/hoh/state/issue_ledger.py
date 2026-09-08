@@ -69,153 +69,9 @@ class IssueLedger:
     def apply(self, evidence: Mapping[str, object], loop_index: int) -> None:
         """Apply one normalized evidence document and write derived counts."""
 
-        if isinstance(loop_index, bool) or not isinstance(loop_index, int) or loop_index < 1:
-            raise ValueError("loop_index must be a positive integer")
-        candidate = evidence.get("candidate_sha")
-        if not isinstance(candidate, str) or not candidate:
-            raise IssueLedgerError("evidence candidate_sha must be non-empty")
-        evidence_sha256 = _canonical_evidence_sha256(evidence)
-
-        document = self.load()
-        raw_issues = document["issues"]
-        assert isinstance(raw_issues, list)
-        applications = document["applications"]
-        assert isinstance(applications, list)
-        correlation_start_loop = document.get(_CORRELATION_START_FIELD)
-        assert correlation_start_loop is None or isinstance(
-            correlation_start_loop, int
-        )
-        applications_by_loop = {
-            application["loop"]: application for application in applications
-        }
-        issues: dict[str, dict[str, object]] = {}
-        history_loop_indices: list[int] = []
-        for issue in raw_issues:
-            if not isinstance(issue, dict):
-                raise IssueLedgerError("issue entries must be objects")
-            claim_id = issue.get("claim_id")
-            if not isinstance(claim_id, str) or not claim_id:
-                raise IssueLedgerError("issue claim_id must be non-empty")
-            if claim_id in issues:
-                raise IssueLedgerError(f"duplicate issue claim_id: {claim_id}")
-            history = issue.get("history")
-            if not isinstance(history, list):
-                raise IssueLedgerError(f"issue history must be a list: {claim_id}")
-            status = issue.get("status")
-            severity = issue.get("severity")
-            if status not in _ISSUE_STATUSES:
-                raise IssueLedgerError(f"issue status is invalid: {claim_id}")
-            if severity not in _GAP_SEVERITIES:
-                raise IssueLedgerError(f"issue severity is invalid: {claim_id}")
-            for field in _ISSUE_TEXT_FIELDS:
-                value = issue.get(field)
-                if not isinstance(value, str) or not value:
-                    raise IssueLedgerError(f"issue {field} must be non-empty: {claim_id}")
-            history_loop_indices.extend(
-                _validated_history(
-                    history,
-                    str(status),
-                    applications_by_loop,
-                    correlation_start_loop,
-                )
-            )
-            issues[claim_id] = deepcopy(issue)
-
-        replay = next(
-            (application for application in applications if application["loop"] == loop_index),
-            None,
-        )
-        if replay is not None:
-            if (
-                replay["candidate"] == candidate
-                and replay["evidence_sha256"] == evidence_sha256
-            ):
-                return
-            raise IssueLedgerError(
-                f"same loop {loop_index} already has a different application identity"
-            )
-
-        latest_loop = max(
-            [application["loop"] for application in applications]
-            + history_loop_indices,
-            default=0,
-        )
-        if loop_index == latest_loop:
-            raise IssueLedgerError(
-                f"same loop {loop_index} has state without a matching application identity"
-            )
-        if loop_index < latest_loop:
-            raise IssueLedgerError(
-                f"loop {loop_index} is out of order after loop {latest_loop}"
-            )
-        if correlation_start_loop is None:
-            correlation_start_loop = loop_index if history_loop_indices else 1
-
-        for gap in _evidence_records(evidence, "gap_records"):
-            claim_id = _record_claim_id(gap)
-            issue = issues.get(claim_id)
-            if issue is None:
-                issue = {"claim_id": claim_id, "status": "open", "history": []}
-                issues[claim_id] = issue
-                status = "open"
-            else:
-                status = "regressed" if issue.get("status") == "closed" else str(
-                    issue.get("status", "open")
-                )
-                if status not in {"open", "regressed"}:
-                    status = "open"
-            issue["status"] = status
-            for key in (
-                "severity",
-                "impact",
-                "recommended_update",
-                "validation_requirement",
-            ):
-                if key in gap:
-                    issue[key] = deepcopy(gap[key])
-            _history(issue).append(
-                {
-                    "loop": loop_index,
-                    "candidate": candidate,
-                    "evidence_path": None,
-                    "observation": _first_observation(gap),
-                    "status": status,
-                }
-            )
-
-        for verified in _evidence_records(evidence, "verified_records"):
-            claim_id = _record_claim_id(verified)
-            issue = issues.get(claim_id)
-            if issue is None:
-                continue
-            issue["status"] = "closed"
-            path, observation = _execution_provenance(verified)
-            _history(issue).append(
-                {
-                    "loop": loop_index,
-                    "candidate": candidate,
-                    "evidence_path": path,
-                    "observation": observation,
-                    "status": "closed",
-                }
-            )
-
-        ordered_issues = [issues[claim_id] for claim_id in sorted(issues)]
-        applications.append(
-            {
-                "loop": loop_index,
-                "candidate": candidate,
-                "evidence_sha256": evidence_sha256,
-            }
-        )
-        updated: dict[str, object] = {
-            "schema_version": _CURRENT_SCHEMA_VERSION,
-            _CORRELATION_START_FIELD: correlation_start_loop,
-            "issues": ordered_issues,
-            "applications": applications,
-            "summary": _derived_summary(ordered_issues),
-        }
-        atomic_write_json(self._path, updated)
+        updated, changed = _apply_evidence(self.load(), evidence, loop_index)
+        if changed:
+            atomic_write_json(self._path, updated)
 
     def summary(self) -> dict[str, int]:
         """Derive counts from issue entries, ignoring any persisted summary."""
@@ -228,33 +84,219 @@ class IssueLedger:
     def validate_replay(
         self, evidence_by_loop: Sequence[tuple[int, Mapping[str, object]]]
     ) -> dict[str, object]:
-        """Read-only check that ledger applications match normalized evidence."""
+        """Reconstruct and exactly verify native state without writing."""
 
-        expected: list[dict[str, object]] = []
+        expected = _empty_document()
+        previous_loop = 0
         for loop_index, evidence in evidence_by_loop:
             if (
                 isinstance(loop_index, bool)
                 or not isinstance(loop_index, int)
-                or loop_index < 1
+                or loop_index <= previous_loop
             ):
-                raise IssueLedgerError("loop_index must be a positive integer")
-            candidate = evidence.get("candidate_sha")
-            if not isinstance(candidate, str) or not candidate:
-                raise IssueLedgerError("evidence candidate_sha must be non-empty")
-            expected.append(
-                {
-                    "loop": loop_index,
-                    "candidate": candidate,
-                    "evidence_sha256": _canonical_evidence_sha256(evidence),
-                }
-            )
-        document = self.load()
-        applications = document.get("applications")
-        if applications != expected:
+                raise IssueLedgerError(
+                    "durable evidence replay loops must strictly increase"
+                )
+            expected, changed = _apply_evidence(expected, evidence, loop_index)
+            if not changed:  # pragma: no cover - guarded by strict loop ordering
+                raise IssueLedgerError("durable evidence replay contains a duplicate")
+            previous_loop = loop_index
+
+        persisted = self._read_persisted_document()
+        expected_persisted = (
+            expected
+            if evidence_by_loop
+            else {"schema_version": _LEGACY_SCHEMA_VERSION, "issues": []}
+        )
+        if _canonical_json(persisted) != _canonical_json(expected_persisted):
             raise IssueLedgerError(
-                "issue ledger applications do not match durable evidence replay"
+                "issue ledger does not match durable evidence replay"
             )
+        return deepcopy(expected)
+
+    def _read_persisted_document(self) -> dict[str, object]:
+        if not self._path.is_file():
+            raise IssueLedgerError("durable issue ledger is unavailable")
+        try:
+            document = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise IssueLedgerError(
+                f"could not read issue ledger: {self._path}"
+            ) from error
+        if not isinstance(document, dict):
+            raise IssueLedgerError("issue ledger must be an object")
         return document
+
+
+def _empty_document() -> dict[str, object]:
+    return {
+        "schema_version": _LEGACY_SCHEMA_VERSION,
+        "issues": [],
+        "applications": [],
+        "summary": _derived_summary([]),
+    }
+
+
+def _apply_evidence(
+    document: Mapping[str, object],
+    evidence: Mapping[str, object],
+    loop_index: int,
+) -> tuple[dict[str, object], bool]:
+    """Purely reduce one normalized evidence record into ledger state."""
+
+    if isinstance(loop_index, bool) or not isinstance(loop_index, int) or loop_index < 1:
+        raise ValueError("loop_index must be a positive integer")
+    candidate = evidence.get("candidate_sha")
+    if not isinstance(candidate, str) or not candidate:
+        raise IssueLedgerError("evidence candidate_sha must be non-empty")
+    evidence_sha256 = _canonical_evidence_sha256(evidence)
+
+    raw_issues = document.get("issues")
+    if not isinstance(raw_issues, list):
+        raise IssueLedgerError("issue ledger must contain an issues list")
+    applications = _validated_applications(document.get("applications", []))
+    correlation_start_loop = _validated_correlation_start_loop(
+        document, applications
+    )
+    applications_by_loop = {
+        application["loop"]: application for application in applications
+    }
+    issues: dict[str, dict[str, object]] = {}
+    history_loop_indices: list[int] = []
+    for raw_issue in raw_issues:
+        if not isinstance(raw_issue, dict):
+            raise IssueLedgerError("issue entries must be objects")
+        claim_id = raw_issue.get("claim_id")
+        if not isinstance(claim_id, str) or not claim_id:
+            raise IssueLedgerError("issue claim_id must be non-empty")
+        if claim_id in issues:
+            raise IssueLedgerError(f"duplicate issue claim_id: {claim_id}")
+        history = raw_issue.get("history")
+        if not isinstance(history, list):
+            raise IssueLedgerError(f"issue history must be a list: {claim_id}")
+        status = raw_issue.get("status")
+        severity = raw_issue.get("severity")
+        if status not in _ISSUE_STATUSES:
+            raise IssueLedgerError(f"issue status is invalid: {claim_id}")
+        if severity not in _GAP_SEVERITIES:
+            raise IssueLedgerError(f"issue severity is invalid: {claim_id}")
+        for field in _ISSUE_TEXT_FIELDS:
+            value = raw_issue.get(field)
+            if not isinstance(value, str) or not value:
+                raise IssueLedgerError(f"issue {field} must be non-empty: {claim_id}")
+        history_loop_indices.extend(
+            _validated_history(
+                history,
+                str(status),
+                applications_by_loop,
+                correlation_start_loop,
+            )
+        )
+        issues[claim_id] = deepcopy(raw_issue)
+
+    replay = next(
+        (
+            application
+            for application in applications
+            if application["loop"] == loop_index
+        ),
+        None,
+    )
+    if replay is not None:
+        if (
+            replay["candidate"] == candidate
+            and replay["evidence_sha256"] == evidence_sha256
+        ):
+            return deepcopy(dict(document)), False
+        raise IssueLedgerError(
+            f"same loop {loop_index} already has a different application identity"
+        )
+
+    latest_loop = max(
+        [application["loop"] for application in applications]
+        + history_loop_indices,
+        default=0,
+    )
+    if loop_index == latest_loop:
+        raise IssueLedgerError(
+            f"same loop {loop_index} has state without a matching application identity"
+        )
+    if loop_index < latest_loop:
+        raise IssueLedgerError(
+            f"loop {loop_index} is out of order after loop {latest_loop}"
+        )
+    if correlation_start_loop is None:
+        correlation_start_loop = loop_index if history_loop_indices else 1
+
+    for gap_record in _evidence_records(evidence, "gap_records"):
+        claim_id = _record_claim_id(gap_record)
+        issue = issues.get(claim_id)
+        if issue is None:
+            issue = {"claim_id": claim_id, "status": "open", "history": []}
+            issues[claim_id] = issue
+            status = "open"
+        else:
+            status = (
+                "regressed"
+                if issue.get("status") == "closed"
+                else str(issue.get("status", "open"))
+            )
+            if status not in {"open", "regressed"}:
+                status = "open"
+        issue["status"] = status
+        for key in (
+            "severity",
+            "impact",
+            "recommended_update",
+            "validation_requirement",
+        ):
+            if key in gap_record:
+                issue[key] = deepcopy(gap_record[key])
+        _history(issue).append(
+            {
+                "loop": loop_index,
+                "candidate": candidate,
+                "evidence_path": None,
+                "observation": _first_observation(gap_record),
+                "status": status,
+            }
+        )
+
+    for verified_record in _evidence_records(evidence, "verified_records"):
+        claim_id = _record_claim_id(verified_record)
+        issue = issues.get(claim_id)
+        if issue is None:
+            continue
+        issue["status"] = "closed"
+        path, observation = _execution_provenance(verified_record)
+        _history(issue).append(
+            {
+                "loop": loop_index,
+                "candidate": candidate,
+                "evidence_path": path,
+                "observation": observation,
+                "status": "closed",
+            }
+        )
+
+    ordered_issues = [issues[claim_id] for claim_id in sorted(issues)]
+    applications.append(
+        {
+            "loop": loop_index,
+            "candidate": candidate,
+            "evidence_sha256": evidence_sha256,
+        }
+    )
+    return (
+        {
+            "schema_version": _CURRENT_SCHEMA_VERSION,
+            _CORRELATION_START_FIELD: correlation_start_loop,
+            "issues": ordered_issues,
+            "applications": applications,
+            "summary": _derived_summary(ordered_issues),
+        },
+        True,
+    )
 
 
 def _evidence_records(
@@ -325,6 +367,19 @@ def _canonical_evidence_sha256(evidence: Mapping[str, object]) -> str:
     except (TypeError, ValueError) as error:
         raise IssueLedgerError("evidence must be canonical JSON data") from error
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _canonical_json(document: Mapping[str, object]) -> str:
+    try:
+        return json.dumps(
+            dict(document),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise IssueLedgerError("issue ledger must be canonical JSON data") from error
 
 
 def _validated_applications(raw: object) -> list[dict[str, object]]:

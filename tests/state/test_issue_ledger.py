@@ -278,6 +278,153 @@ def test_exact_evidence_replay_is_idempotent_and_uses_canonical_identity(
     assert len(application["evidence_sha256"]) == 64
 
 
+def multiloop_replay_fixture(
+    path: Path,
+) -> tuple[IssueLedger, list[tuple[int, dict[str, object]]]]:
+    """Create a native open -> closed -> regressed ledger starting at loop 2."""
+
+    entries = [
+        (
+            2,
+            evidence(
+                "a" * 40,
+                gap_records=[gap("player-moves"), gap("audio", "minor")],
+            ),
+        ),
+        (
+            3,
+            evidence(
+                "b" * 40,
+                verified_records=[verified("player-moves", "checks/pass-3.log")],
+            ),
+        ),
+        (
+            4,
+            evidence(
+                "c" * 40,
+                gap_records=[gap("player-moves", "blocker")],
+            ),
+        ),
+    ]
+    ledger = IssueLedger(path)
+    for loop_index, normalized in entries:
+        ledger.apply(normalized, loop_index)
+    return ledger, entries
+
+
+def test_validate_replay_reconstructs_multiloop_issue_lifecycle_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Dropping a replayed lifecycle transition must make this fail."""
+
+    path = tmp_path / "issue-ledger.json"
+    ledger, entries = multiloop_replay_fixture(path)
+    before = path.read_bytes()
+
+    replayed = ledger.validate_replay(entries)
+
+    assert path.read_bytes() == before
+    assert replayed["application_correlation_start_loop"] == 1
+    assert [application["loop"] for application in replayed["applications"]] == [
+        2,
+        3,
+        4,
+    ]
+    player = next(
+        issue for issue in replayed["issues"] if issue["claim_id"] == "player-moves"
+    )
+    assert player["status"] == "regressed"
+    assert [event["status"] for event in player["history"]] == [
+        "open",
+        "closed",
+        "regressed",
+    ]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "schema",
+        "boundary",
+        "severity",
+        "impact",
+        "provenance",
+        "current-status",
+        "history-order",
+        "issue-order",
+        "summary",
+    ],
+)
+def test_validate_replay_rejects_full_native_ledger_tampering_without_writing(
+    tmp_path: Path, tamper: str
+) -> None:
+    """Comparing only application identities must make every case fail."""
+
+    path = tmp_path / "issue-ledger.json"
+    ledger, entries = multiloop_replay_fixture(path)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    player = next(
+        issue for issue in document["issues"] if issue["claim_id"] == "player-moves"
+    )
+    if tamper == "schema":
+        document["schema_version"] = 1
+        document.pop("application_correlation_start_loop")
+    elif tamper == "boundary":
+        document["application_correlation_start_loop"] = 2
+    elif tamper == "severity":
+        player["severity"] = "minor"
+    elif tamper == "impact":
+        player["impact"] = "forged impact"
+    elif tamper == "provenance":
+        player["history"][1]["evidence_path"] = "checks/forged.log"
+    elif tamper == "current-status":
+        player["status"] = "open"
+    elif tamper == "history-order":
+        player["history"][1], player["history"][2] = (
+            player["history"][2],
+            player["history"][1],
+        )
+    elif tamper == "issue-order":
+        document["issues"].reverse()
+    elif tamper == "summary":
+        document["summary"] = {
+            "total": 2,
+            "open": 0,
+            "closed": 2,
+            "regressed": 0,
+        }
+    else:  # pragma: no cover - guards the parameter table
+        raise AssertionError(f"unknown tamper case: {tamper}")
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    tampered = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="durable evidence replay"):
+        ledger.validate_replay(entries)
+
+    assert path.read_bytes() == tampered
+
+
+def test_validate_replay_rejects_unauthenticated_legacy_prefix_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Trusting legacy history absent from normalized evidence must make this fail."""
+
+    path = tmp_path / "issue-ledger.json"
+    write_legacy_open_issue(path)
+    ledger = IssueLedger(path)
+    loop_2 = evidence(
+        "b" * 40,
+        verified_records=[verified("player-moves", "checks/pass-2.log")],
+    )
+    ledger.apply(loop_2, 2)
+    before = path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="durable evidence replay"):
+        ledger.validate_replay([(2, loop_2)])
+
+    assert path.read_bytes() == before
+
+
 def test_exact_replay_rejects_duplicate_persisted_claim_ids_without_writing(
     tmp_path: Path,
 ) -> None:

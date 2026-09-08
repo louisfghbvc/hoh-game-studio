@@ -16,6 +16,7 @@ from hoh.models import Role, Sandbox
 from hoh.orchestrator import PreflightError, ResumeError, RoleOutputError
 from hoh.policy import StopPolicy
 from hoh.state.evidence import EvidenceBindingError
+from hoh.state.issue_ledger import IssueLedgerError
 from hoh.state.store import StateConflictError
 from hoh.vcs.git import ProtectedPathError
 
@@ -202,6 +203,34 @@ def test_authoritative_inspection_replays_hash_bound_evidence_intents_and_ledger
     intent_path.write_bytes(intent_bytes)
 
     assert services.orchestrator.inspect_latest()[1]["completed_loops"] == 1
+
+
+def test_authoritative_inspection_rejects_issue_mutation_after_qa_before_closure(
+    tmp_path: Path,
+) -> None:
+    """Trusting mutable issue state when QA evidence is durable must make this fail."""
+
+    project, services = orchestrator_fixture(tmp_path)
+
+    def crash_before_evidence_commit(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("crash after QA before closure")
+
+    services.git.prepare_evidence = crash_before_evidence_commit  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="crash after QA before closure"):
+        services.orchestrator.run(max_loops=1)
+
+    ledger_path = project / ".hoh" / "issue-ledger.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert len(ledger["issues"]) == 1
+    assert ledger["issues"][0]["status"] == "open"
+    ledger["issues"][0]["status"] = "closed"
+    ledger_path.write_text(json.dumps(ledger, indent=2) + "\n", encoding="utf-8")
+    tampered = ledger_path.read_bytes()
+
+    with pytest.raises(IssueLedgerError, match="durable evidence replay"):
+        services.orchestrator.inspect_latest()
+
+    assert ledger_path.read_bytes() == tampered
 
 
 @pytest.mark.parametrize("cancellation", [KeyboardInterrupt(), asyncio.CancelledError()])
