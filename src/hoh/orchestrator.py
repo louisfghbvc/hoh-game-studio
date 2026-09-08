@@ -468,15 +468,20 @@ class HoHOrchestrator:
             if candidate is None or manifest is None:
                 raise StateConflictError("durable QA has no candidate checks")
             payload = payloads[Phase.QA]
+            response_descriptor = _required_mapping(payload, "response")
+            invocation_id = _required_text(payload, "qa_invocation_id")
+            self._validate_qa_invocation(
+                run_id,
+                loop_index,
+                loop_dir,
+                invocation_id,
+                response_descriptor,
+            )
             response = self._read_descriptor(payload, "response")
             evidence = self._read_descriptor(payload, "evidence")
             self._require_candidate_binding(evidence, candidate)
             self._revalidate_qa_response(
                 loop_index, loop_dir, response, evidence, candidate, manifest
-            )
-            invocation_id = _required_text(payload, "qa_invocation_id")
-            self._validate_qa_invocation(
-                run_id, loop_index, loop_dir, invocation_id
             )
             release_gate: dict[str, object] = {}
             release_gate_path = loop_dir / "release-gate.json"
@@ -999,15 +1004,20 @@ class HoHOrchestrator:
     ) -> dict[str, object]:
         payload = self._phase_payload(run_id, loop_index, Phase.QA)
         if payload is not None:
+            response_descriptor = _required_mapping(payload, "response")
+            invocation_id = _required_text(payload, "qa_invocation_id")
+            self._validate_qa_invocation(
+                run_id,
+                loop_index,
+                loop_dir,
+                invocation_id,
+                response_descriptor,
+            )
             response = self._read_descriptor(payload, "response")
             evidence = self._read_descriptor(payload, "evidence")
             self._require_candidate_binding(evidence, candidate)
             self._revalidate_qa_response(
                 loop_index, loop_dir, response, evidence, candidate, manifest
-            )
-            invocation_id = _required_text(payload, "qa_invocation_id")
-            self._validate_qa_invocation(
-                run_id, loop_index, loop_dir, invocation_id
             )
             self.issue_ledger.apply(evidence, loop_index)
             release_gate = self._ensure_release_gate(
@@ -1028,7 +1038,7 @@ class HoHOrchestrator:
         candidate_sha = _required_text(candidate, "candidate_sha")
         skills = self._qa_skills()
 
-        def qa(frozen: Path) -> tuple[dict[str, object], str]:
+        def qa(frozen: Path) -> tuple[dict[str, object], dict[str, object]]:
             context_checks = {
                 "scope": "candidate",
                 "candidate_sha": candidate_sha,
@@ -1062,11 +1072,13 @@ class HoHOrchestrator:
                     Role.QA, response, loop_index
                 ),
             )
-            return raw, _required_text(receipt, "invocation_id")
+            return raw, receipt
 
-        raw, invocation_id = self._with_frozen_candidate(
+        raw, qa_receipt = self._with_frozen_candidate(
             run_id, loop_index, candidate_sha, qa
         )
+        invocation_id = _required_text(qa_receipt, "invocation_id")
+        response_descriptor = _required_mapping(qa_receipt, "response")
         normalizer = EvidenceNormalizer(
             loop_dir, self.config.project / ".hoh" / "requirements.json"
         )
@@ -1078,15 +1090,24 @@ class HoHOrchestrator:
         )
         response_path = loop_dir / "qa-response.json"
         evidence_path = loop_dir / "evidence.json"
-        atomic_write_json(response_path, raw)
+        if response_descriptor != self._descriptor(response_path):
+            raise StateConflictError(
+                "successful QA receipt has a different response descriptor"
+            )
         atomic_write_json(evidence_path, normalized)
         phase_payload: dict[str, object] = {
-            "response": self._descriptor(response_path),
+            "response": response_descriptor,
             "evidence": self._descriptor(evidence_path),
             "qa_invocation_id": invocation_id,
         }
         self.store.complete_phase(run_id, loop_index, Phase.QA, phase_payload)
-        self._validate_qa_invocation(run_id, loop_index, loop_dir, invocation_id)
+        self._validate_qa_invocation(
+            run_id,
+            loop_index,
+            loop_dir,
+            invocation_id,
+            response_descriptor,
+        )
         self.issue_ledger.apply(normalized, loop_index)
         release_gate = self._ensure_release_gate(
             run_id,
@@ -1110,17 +1131,29 @@ class HoHOrchestrator:
         loop_index: int,
         loop_dir: Path,
         invocation_id: str,
+        response_descriptor: Mapping[str, object],
+        *,
+        invocation_kind: str = "ordinary",
     ) -> None:
         successful = [
             receipt
             for receipt in self._validated_role_attempts(
-                run_id, loop_index, loop_dir, Role.QA, "ordinary"
+                run_id, loop_index, loop_dir, Role.QA, invocation_kind
             )
             if receipt.get("outcome") == "success"
         ]
-        if len(successful) != 1 or successful[0].get("invocation_id") != invocation_id:
+        durable_descriptor = (
+            successful[0].get("response") if len(successful) == 1 else None
+        )
+        if (
+            len(successful) != 1
+            or successful[0].get("invocation_id") != invocation_id
+            or not isinstance(durable_descriptor, Mapping)
+            or dict(durable_descriptor) != dict(response_descriptor)
+        ):
             raise StateConflictError(
-                "durable QA phase has a different successful invocation identity"
+                "durable QA phase has a different successful invocation identity "
+                "or response descriptor"
             )
 
     def _ensure_release_gate(
@@ -1197,7 +1230,12 @@ class HoHOrchestrator:
 
         def release(
             frozen: Path,
-        ) -> tuple[dict[str, object], dict[str, object], dict[str, object], str]:
+        ) -> tuple[
+            dict[str, object],
+            dict[str, object],
+            dict[str, object],
+            dict[str, object],
+        ]:
             bundle = self.adapter.check(AdapterContext(frozen, output), plan)
             collected = self.adapter.collect(AdapterContext(frozen, output), bundle)
             checks: dict[str, object] = {
@@ -1265,11 +1303,13 @@ class HoHOrchestrator:
                     Role.QA, response, loop_index
                 ),
             )
-            return checks, manifest, raw, _required_text(receipt, "invocation_id")
+            return checks, manifest, raw, receipt
 
-        checks, manifest, raw, invocation_id = self._with_frozen_candidate(
+        checks, manifest, raw, qa_receipt = self._with_frozen_candidate(
             run_id, loop_index, candidate_sha, release
         )
+        invocation_id = _required_text(qa_receipt, "invocation_id")
+        response_descriptor = _required_mapping(qa_receipt, "response")
         normalizer = EvidenceNormalizer(
             loop_dir, self.config.project / ".hoh" / "requirements.json"
         )
@@ -1281,7 +1321,10 @@ class HoHOrchestrator:
         )
         release_response_path = loop_dir / "release-qa-response.json"
         release_evidence_path = loop_dir / "release-evidence.json"
-        atomic_write_json(release_response_path, raw)
+        if response_descriptor != self._descriptor(release_response_path):
+            raise StateConflictError(
+                "successful full-release QA receipt has a different response descriptor"
+            )
         atomic_write_json(release_evidence_path, normalized)
         checks_path = loop_dir / "release-checks.json"
         manifest_path = loop_dir / "release-adapter-manifest.json"
@@ -1303,7 +1346,7 @@ class HoHOrchestrator:
             "deterministic_checks_candidate_sha": candidate_sha,
             "checks": self._descriptor(checks_path),
             "manifest": self._descriptor(manifest_path),
-            "response": self._descriptor(release_response_path),
+            "response": response_descriptor,
             "evidence": self._descriptor(release_evidence_path),
         }
 
@@ -1320,7 +1363,16 @@ class HoHOrchestrator:
         self._require_candidate_binding(release_gate, candidate)
         if release_gate.get("scope") != "full_release":
             raise StateConflictError("durable release gate has the wrong scope")
-        _required_text(release_gate, "invocation_id")
+        invocation_id = _required_text(release_gate, "invocation_id")
+        response_descriptor = _required_mapping(release_gate, "response")
+        self._validate_qa_invocation(
+            _required_text(candidate, "run_id"),
+            _required_positive_int(candidate, "loop_index"),
+            loop_dir,
+            invocation_id,
+            response_descriptor,
+            invocation_kind="full-release",
+        )
         check_id = _required_text(release_gate, "check_id")
         if release_gate.get("deterministic_checks_candidate_sha") != candidate.get(
             "candidate_sha"
@@ -1865,6 +1917,28 @@ class HoHOrchestrator:
             run_id, loop_index, loop_dir, role, invocation_kind
         )
         attempts_used = len(durable_attempts)
+        if role is Role.QA:
+            successful = [
+                receipt
+                for receipt in durable_attempts
+                if receipt.get("outcome") == "success"
+            ]
+            if successful:
+                receipt = successful[0]
+                response = self._validated_successful_qa_response(
+                    loop_index,
+                    loop_dir,
+                    receipt,
+                    invocation_kind,
+                )
+                try:
+                    if response_validator is not None:
+                        response_validator(response)
+                except RoleOutputError as error:
+                    raise StateConflictError(
+                        "durable successful QA response no longer satisfies its role contract"
+                    ) from error
+                return response, receipt
         if attempts_used >= maximum_attempts:
             raise StateConflictError(
                 f"durable {role.value} {invocation_kind} receipt history exhausts "
@@ -2032,6 +2106,11 @@ class HoHOrchestrator:
             )
             atomic_write_json(receipt_path, receipt)
             raise
+        response_descriptor: dict[str, str] | None = None
+        if role is Role.QA:
+            response_descriptor = self._persist_successful_qa_response(
+                loop_dir, invocation_kind, result.response
+            )
         receipt = self._receipt(
             invocation_id,
             role,
@@ -2044,9 +2123,95 @@ class HoHOrchestrator:
             retained_events,
             outcome="success",
             error=None,
+            response_descriptor=response_descriptor,
         )
         atomic_write_json(receipt_path, receipt)
         return dict(result.response), receipt
+
+    @staticmethod
+    def _qa_response_path(loop_dir: Path, invocation_kind: str) -> Path:
+        if invocation_kind == "ordinary":
+            return loop_dir / "qa-response.json"
+        if invocation_kind == "full-release":
+            return loop_dir / "release-qa-response.json"
+        raise StateConflictError("durable QA receipt invocation kind is invalid")
+
+    def _persist_successful_qa_response(
+        self,
+        loop_dir: Path,
+        invocation_kind: str,
+        response: Mapping[str, object],
+    ) -> dict[str, str]:
+        """Persist an immutable raw QA response before its success receipt."""
+
+        response_path = self._qa_response_path(loop_dir, invocation_kind)
+        response_root = response_path.parent
+        if response_root.is_symlink() or (
+            response_root.exists() and not response_root.is_dir()
+        ):
+            raise StateConflictError(
+                "durable successful QA response authority is not a directory"
+            )
+        if response_path.exists() or response_path.is_symlink():
+            try:
+                retained_path = self._required_regular_evidence_path(
+                    response_path, loop_dir
+                )
+                retained = _read_json(retained_path)
+            except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+                raise StateConflictError(
+                    "durable successful QA response artifact is malformed"
+                ) from error
+            if retained != dict(response):
+                raise StateConflictError(
+                    "durable successful QA response artifact is immutable"
+                )
+        else:
+            atomic_write_json(response_path, dict(response))
+        self._required_regular_evidence_path(response_path, loop_dir)
+        return self._descriptor(response_path)
+
+    def _validated_successful_qa_response(
+        self,
+        loop_index: int,
+        loop_dir: Path,
+        receipt: Mapping[str, object],
+        invocation_kind: str,
+    ) -> dict[str, object]:
+        descriptor = receipt.get("response")
+        expected_path = self._qa_response_path(loop_dir, invocation_kind)
+        expected_relative = self._project_relative(expected_path)
+        if (
+            not isinstance(descriptor, Mapping)
+            or set(descriptor) != {"path", "sha256"}
+            or descriptor.get("path") != expected_relative
+            or not isinstance(descriptor.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(descriptor.get("sha256"))) is None
+        ):
+            raise StateConflictError(
+                "durable successful QA receipt response descriptor is malformed"
+            )
+        try:
+            response_path = self._required_regular_evidence_path(
+                expected_path, loop_dir
+            )
+            if _file_sha256(response_path) != descriptor["sha256"]:
+                raise StateConflictError(
+                    "durable successful QA receipt response hash does not match"
+                )
+            response = _read_json(response_path)
+        except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+            raise StateConflictError(
+                "durable successful QA receipt response artifact is invalid"
+            ) from error
+        try:
+            self._validate_schema(Role.QA, response)
+            self._validate_role_semantics(Role.QA, response, loop_index)
+        except RoleOutputError as error:
+            raise StateConflictError(
+                "durable successful QA receipt response fails its role contract"
+            ) from error
+        return response
 
     def _invocation_boundary_error(
         self,
@@ -2175,6 +2340,7 @@ class HoHOrchestrator:
         *,
         outcome: str,
         error: BaseException | None,
+        response_descriptor: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         usage = asdict(result.usage) if result is not None else asdict(_empty_usage())
         receipt: dict[str, object] = {
@@ -2213,6 +2379,16 @@ class HoHOrchestrator:
                 "type": type(error).__name__,
                 "message": str(error),
             }
+        if role is Role.QA and outcome == "success":
+            if response_descriptor is None:
+                raise AssertionError(
+                    "a successful QA receipt requires a durable response descriptor"
+                )
+            receipt["response"] = dict(response_descriptor)
+        elif response_descriptor is not None:
+            raise AssertionError(
+                "only a successful QA receipt may bind a response descriptor"
+            )
         return receipt
 
     def _prompt_context(
@@ -2781,6 +2957,7 @@ class HoHOrchestrator:
             if ordered != list(range(1, len(ordered) + 1)):
                 raise StateConflictError("durable receipt attempt sequence is ambiguous")
 
+        successful_qa_groups: set[tuple[str, str]] = set()
         for (role_value, kind, attempt), (path, external) in sorted(
             indexed.items(), key=lambda item: item[0]
         ):
@@ -2812,10 +2989,24 @@ class HoHOrchestrator:
                 raise StateConflictError(
                     "durable boundary-audit receipt is stored in the wrong authority"
                 )
+            qa_group = (role_value, kind)
+            if role_value == Role.QA.value and qa_group in successful_qa_groups:
+                raise StateConflictError(
+                    "durable QA receipt history continues after a successful identity"
+                )
             if outcome == "success":
                 if "error" in receipt:
                     raise StateConflictError("durable success receipt is ambiguous")
+                if role_value == Role.QA.value:
+                    self._validated_successful_qa_response(
+                        loop_index, loop_dir, receipt, kind
+                    )
+                    successful_qa_groups.add(qa_group)
             else:
+                if role_value == Role.QA.value and "response" in receipt:
+                    raise StateConflictError(
+                        "durable failed QA receipt has an ambiguous response"
+                    )
                 error = receipt.get("error")
                 if (
                     not isinstance(error, Mapping)

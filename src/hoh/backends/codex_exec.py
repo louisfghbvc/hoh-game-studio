@@ -33,17 +33,20 @@ from hoh.processes import (
 _SECRET_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|AUTH", re.IGNORECASE)
 _AUTHORIZATION_ASSIGNMENT = re.compile(
     r"(?i)(?P<prefix>[\"']?(?:Proxy-)?Authorization[\"']?\s*[:=]\s*)"
-    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n,;]+)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|"
+    r"(?i:Bearer)\s+[^\s,;\"'}\]]+|[^\r\n,;\"'}\]]+)"
 )
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)(?P<prefix>[\"']?[A-Za-z0-9_.-]*"
     r"(?:TOKEN|KEY|SECRET|PASSWORD|AUTH)[A-Za-z0-9_.-]*[\"']?\s*[:=]\s*)"
-    r"(?P<value>(?i:Bearer)\s+[^\s,;]+|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
+    r"(?P<value>(?i:Bearer)\s+[^\s,;\"'}\]]+|\"(?:\\.|[^\"\\])*\"|"
+    r"'(?:\\.|[^'\\])*'|[^\s,;\"'}\]]+)"
 )
 _SECRET_OPTION = re.compile(
     r"(?i)(?P<prefix>--?[A-Za-z0-9_.-]*"
     r"(?:TOKEN|KEY|SECRET|PASSWORD|AUTH)[A-Za-z0-9_.-]*\s+)"
-    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
+    r"(?P<value>(?i:Bearer)\s+[^\s,;\"'}\]]+|\"(?:\\.|[^\"\\])*\"|"
+    r"'(?:\\.|[^'\\])*'|[^\s,;\"'}\]]+)"
 )
 _BEARER_CREDENTIAL = re.compile(
     r"(?<![A-Za-z0-9_])(?P<prefix>(?i:Bearer)\s+)"

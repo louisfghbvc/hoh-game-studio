@@ -236,6 +236,38 @@ def test_process_errors_redact_secret_command_option_values(tmp_path: Path) -> N
     assert "--auth <redacted>" in str(raised.value)
 
 
+def test_process_errors_redact_complete_spaced_bearer_option_values(
+    tmp_path: Path,
+) -> None:
+    request = agent_request(tmp_path)
+    diagnostic = (
+        "command: tool --auth Bearer super-secret-token "
+        "--token Bearer second-secret-token "
+        "Authorization=Bearer third-secret-token --model safe"
+    )
+    backend = executable_backend(
+        request.workspace,
+        f"import sys\nsys.stderr.write({diagnostic!r})\nsys.exit(9)\n",
+    )
+
+    with pytest.raises(BackendProcessError) as raised:
+        backend.run(request)
+
+    message = str(raised.value)
+    for secret in (
+        "super-secret-token",
+        "second-secret-token",
+        "third-secret-token",
+        "super-secret",
+        "second-secret",
+        "third-secret",
+    ):
+        assert secret not in message
+    assert "--auth <redacted>" in message
+    assert "--token <redacted>" in message
+    assert "Authorization=<redacted>" in message
+
+
 def test_process_errors_redact_quoted_and_equal_secret_values(tmp_path: Path) -> None:
     request = agent_request(tmp_path)
     diagnostic = (
@@ -334,6 +366,42 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "cached
     event = json.loads(retained.splitlines()[0])
     assert event["note"] == "The bearer of good news is ordinary text."
     assert json.loads(event["error"]["json"])["Authorization"] == "<redacted>"
+
+
+def test_retained_nested_event_redacts_spaced_bearer_options_without_plain_text_loss(
+    tmp_path: Path,
+) -> None:
+    request = agent_request(tmp_path)
+    backend = executable_backend(
+        request.workspace,
+        """import json
+response = {"status": "pass"}
+detail = "tool --auth Bearer super-secret-token"
+nested = json.dumps({"command": "tool --token Bearer second-secret-token", "header": "Authorization: Bearer third-secret-token"})
+print(json.dumps({"type": "item.completed", "error": {"detail": detail, "nested": nested}, "note": "The bearer of good news is ordinary text.", "item": {"type": "agent_message", "text": json.dumps(response)}}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}}))
+""",
+    )
+
+    backend.run(request)
+
+    retained = request.events_path.read_text(encoding="utf-8")
+    for secret in (
+        "super-secret-token",
+        "second-secret-token",
+        "third-secret-token",
+        "super-secret",
+        "second-secret",
+        "third-secret",
+    ):
+        assert secret not in retained
+    event = json.loads(retained.splitlines()[0])
+    assert event["error"]["detail"] == "tool --auth <redacted>"
+    assert json.loads(event["error"]["nested"]) == {
+        "command": "tool --token <redacted>",
+        "header": "Authorization: <redacted>",
+    }
+    assert event["note"] == "The bearer of good news is ordinary text."
 
 
 def test_timeout_raises_distinct_error(tmp_path: Path) -> None:

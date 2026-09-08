@@ -179,9 +179,11 @@ A release result is not interchangeable with the ordinary candidate check.
 
 The QA phase journal binds descriptors for both `qa-response.json` and the
 normalized `evidence.json`, plus the ordinary QA invocation ID. The host
-completes that phase before applying evidence to the issue ledger or starting
-the release gate. When the separate gate runs, its result is atomically stored
-in `release-gate.json` with every field below:
+first atomically persists and hashes the raw response, then writes the successful
+QA receipt that binds the same descriptor. It completes the phase before
+applying evidence to the issue ledger or starting the release gate. When the
+separate gate runs, its result is atomically stored in `release-gate.json` with
+every field below:
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -384,11 +386,18 @@ not by itself prove the run complete.
 | `usage` | usage object | Token counters returned by the backend, or zeros when no result exists. |
 | `return_code` | integer or null | Backend process return code, null when no result exists. |
 | `executable_version` | string | Captured Codex executable version, or `unknown`. |
+| `response` | descriptor object, successful QA only | Project-relative `path` and file `sha256` for the immutable ordinary or full-release raw QA response. |
 | `error` | object, optional | Present for non-success outcomes; contains `type` and `message` strings. |
 
 Each `skills[]` object has `skill_id`, `version`, and content `sha256`. Each
 `usage` object has `input_tokens`, `cached_input_tokens`, `output_tokens`, and
 `reasoning_output_tokens`, all nonnegative integers.
+
+A successful QA receipt is durable only after its response artifact. If a crash
+lands before the QA phase journal or `release-gate.json`, resume validates the
+receipt identity, descriptor, hash, schema, candidate/tree binding, and cited
+artifact hashes, then replays that exact response without another QA invocation.
+Missing, mismatched, or tampered response artifacts fail closed.
 
 Valid successful-attempt example:
 

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,7 @@ from tests.orchestrator.helpers import (
     crashed_after_candidate_fixture,
     RecordingAdapter,
     ScriptedBackend,
+    Services,
     build_services,
     config_for,
     developer_change,
@@ -26,6 +28,69 @@ from tests.orchestrator.helpers import (
     qa_response,
     run_git,
 )
+
+
+def _crash_immediately_after_successful_qa_invocation(
+    tmp_path: Path, invocation_kind: str
+) -> tuple[Path, Services, Path, dict[str, object]]:
+    project = initialized_product(tmp_path)
+    responses = [
+        FakeResponse(plan()),
+        FakeResponse(developer_response(), on_run=developer_change),
+        FakeResponse(
+            lambda request: qa_response(
+                request, include_major_gap=invocation_kind == "ordinary"
+            )
+        ),
+    ]
+    if invocation_kind == "full-release":
+        responses.append(
+            FakeResponse(lambda request: qa_response(request, include_major_gap=False))
+        )
+    services = build_services(project, FakeAgentBackend(responses), RecordingAdapter())
+    invoke_role = services.orchestrator._invoke_role
+    crashed = False
+
+    def invoke_then_crash(*args, **kwargs):
+        nonlocal crashed
+        result = invoke_role(*args, **kwargs)
+        if (
+            not crashed
+            and args[3] is Role.QA
+            and kwargs.get("invocation_kind") == invocation_kind
+        ):
+            crashed = True
+            raise RuntimeError(f"crash after {invocation_kind} QA invocation")
+        return result
+
+    services.orchestrator._invoke_role = invoke_then_crash  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match=f"after {invocation_kind} QA"):
+        services.orchestrator.run(max_loops=1)
+    services.orchestrator._invoke_role = invoke_role  # type: ignore[method-assign]
+    run_dir = next((project / ".hoh" / "runs").iterdir())
+    receipt_name = (
+        "qa-attempt-01.json"
+        if invocation_kind == "ordinary"
+        else "qa-full-release-attempt-01.json"
+    )
+    receipt = json.loads(
+        (run_dir / "loops" / "loop-0001" / "receipts" / receipt_name).read_text(
+            encoding="utf-8"
+        )
+    )
+    return project, services, run_dir, receipt
+
+
+def _assert_receipt_response_is_hash_bound(
+    project: Path, receipt: dict[str, object]
+) -> Path:
+    descriptor = receipt["response"]
+    assert isinstance(descriptor, dict)
+    assert set(descriptor) == {"path", "sha256"}
+    path = project / str(descriptor["path"])
+    assert path.is_file()
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == descriptor["sha256"]
+    return path
 
 
 def test_resume_does_not_repeat_completed_developer(tmp_path: Path) -> None:
@@ -39,6 +104,71 @@ def test_resume_does_not_repeat_completed_developer(tmp_path: Path) -> None:
     assert result["current_candidate"] == original_candidate
     assert count_candidate_commits(project) == 1
     assert not any((project / ".hoh" / "tmp").glob("qa-*"))
+
+
+def test_resume_replays_successful_ordinary_qa_receipt_without_backend(
+    tmp_path: Path,
+) -> None:
+    project, services, run_dir, receipt = (
+        _crash_immediately_after_successful_qa_invocation(tmp_path, "ordinary")
+    )
+    response_descriptor = dict(receipt["response"])
+    _assert_receipt_response_is_hash_bound(project, receipt)
+    phase_path = run_dir / "loops" / "loop-0001" / "phase-state.json"
+    phase = json.loads(phase_path.read_text(encoding="utf-8"))
+    assert "qa" not in phase["completed"]
+    services.backend.requests.clear()
+
+    result = services.orchestrator.resume()
+
+    assert services.backend.requests == []
+    assert result["terminal_status"] == "budget_exhausted"
+    phase = json.loads(phase_path.read_text(encoding="utf-8"))
+    qa_phase = phase["completed"]["qa"]["payload"]
+    assert qa_phase["qa_invocation_id"] == receipt["invocation_id"]
+    assert qa_phase["response"] == response_descriptor
+
+
+def test_resume_replays_successful_full_release_qa_receipt_without_backend(
+    tmp_path: Path,
+) -> None:
+    project, services, run_dir, receipt = (
+        _crash_immediately_after_successful_qa_invocation(tmp_path, "full-release")
+    )
+    response_descriptor = dict(receipt["response"])
+    _assert_receipt_response_is_hash_bound(project, receipt)
+    gate_path = run_dir / "loops" / "loop-0001" / "release-gate.json"
+    assert not gate_path.exists()
+    services.backend.requests.clear()
+
+    result = services.orchestrator.resume()
+
+    assert services.backend.requests == []
+    assert result["terminal_status"] == "complete"
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    assert gate["invocation_id"] == receipt["invocation_id"]
+    assert gate["response"] == response_descriptor
+
+
+@pytest.mark.parametrize("invocation_kind", ["ordinary", "full-release"])
+@pytest.mark.parametrize("mutation", ["missing", "tampered"])
+def test_resume_fails_closed_when_successful_qa_receipt_response_is_unavailable(
+    tmp_path: Path, invocation_kind: str, mutation: str
+) -> None:
+    project, services, _, receipt = _crash_immediately_after_successful_qa_invocation(
+        tmp_path, invocation_kind
+    )
+    response_path = _assert_receipt_response_is_hash_bound(project, receipt)
+    if mutation == "missing":
+        response_path.unlink()
+    else:
+        response_path.write_text("{}\n", encoding="utf-8")
+    services.backend.requests.clear()
+
+    with pytest.raises(StateConflictError, match="response|artifact|receipt"):
+        services.orchestrator.resume()
+
+    assert services.backend.requests == []
 
 
 def test_resume_after_ledger_apply_uses_phase_bound_qa_evidence_without_reinvoking(
