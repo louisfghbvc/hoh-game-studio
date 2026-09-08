@@ -5,10 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import signal
 import subprocess
 import threading
-import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import IO
@@ -22,21 +20,35 @@ from hoh.backends.base import (
     BackendTimeout,
 )
 from hoh.models import Role, Sandbox
+from hoh.processes import (
+    CLEANUP_TIMEOUT_SECONDS as _CLEANUP_TIMEOUT_SECONDS,
+    close_pipe_descriptors,
+    join_threads,
+    process_group_options,
+    terminate_process_tree,
+    wait_after_termination,
+)
 
 
 _SECRET_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|AUTH", re.IGNORECASE)
+_AUTHORIZATION_ASSIGNMENT = re.compile(
+    r"(?i)(?P<prefix>[\"']?(?:Proxy-)?Authorization[\"']?\s*[:=]\s*)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\r\n,;]+)"
+)
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)(?P<prefix>[\"']?[A-Za-z0-9_.-]*"
     r"(?:TOKEN|KEY|SECRET|PASSWORD|AUTH)[A-Za-z0-9_.-]*[\"']?\s*[:=]\s*)"
-    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
+    r"(?P<value>(?i:Bearer)\s+[^\s,;]+|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
 )
 _SECRET_OPTION = re.compile(
     r"(?i)(?P<prefix>--?[A-Za-z0-9_.-]*"
     r"(?:TOKEN|KEY|SECRET|PASSWORD|AUTH)[A-Za-z0-9_.-]*\s+)"
     r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
 )
-_CLEANUP_TIMEOUT_SECONDS = 1.0
-_TREE_TERMINATION_TIMEOUT_SECONDS = 3.0
+_BEARER_CREDENTIAL = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<prefix>(?i:Bearer)\s+)"
+    r"(?P<value>[A-Za-z0-9._~+/=-]{8,})"
+)
 _VERSION_TIMEOUT_SECONDS = 5.0
 
 
@@ -227,48 +239,15 @@ class CodexExecBackend:
 
     @staticmethod
     def _process_group_options() -> dict[str, object]:
-        if os.name == "nt":
-            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        return {"start_new_session": True}
+        return process_group_options()
 
     @staticmethod
     def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
-        if os.name == "nt":
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=_TREE_TERMINATION_TIMEOUT_SECONDS,
-                    shell=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        else:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
-        if process.poll() is None:
-            try:
-                process.kill()
-            except OSError:
-                pass
+        terminate_process_tree(process)
 
     @staticmethod
     def _wait_after_termination(process: subprocess.Popen[str]) -> int:
-        try:
-            return process.wait(timeout=_CLEANUP_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            try:
-                process.kill()
-            except OSError:
-                pass
-            try:
-                return process.wait(timeout=0.25)
-            except subprocess.TimeoutExpired:
-                return process.returncode if process.returncode is not None else -1
+        return wait_after_termination(process)
 
     @staticmethod
     def _join_threads(
@@ -276,24 +255,11 @@ class CodexExecBackend:
         *,
         timeout: float = _CLEANUP_TIMEOUT_SECONDS,
     ) -> bool:
-        deadline = time.monotonic() + timeout
-        for thread in threads:
-            thread.join(max(0.0, deadline - time.monotonic()))
-        return all(not thread.is_alive() for thread in threads)
+        return join_threads(threads, timeout=timeout)
 
     @staticmethod
     def _close_pipe_descriptors(process: subprocess.Popen[str]) -> None:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is None:
-                continue
-            try:
-                descriptor = stream.fileno()
-            except (OSError, ValueError):
-                continue
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+        close_pipe_descriptors(process)
 
     @staticmethod
     def _validate_request(request: AgentRequest) -> None:
@@ -441,10 +407,16 @@ class CodexExecBackend:
         )
         for value in secret_values:
             redacted = redacted.replace(value, "<redacted>")
+        redacted = _AUTHORIZATION_ASSIGNMENT.sub(
+            CodexExecBackend._redacted_match, redacted
+        )
         redacted = _SECRET_ASSIGNMENT.sub(
             CodexExecBackend._redacted_match, redacted
         )
-        return _SECRET_OPTION.sub(CodexExecBackend._redacted_match, redacted)
+        redacted = _SECRET_OPTION.sub(CodexExecBackend._redacted_match, redacted)
+        return _BEARER_CREDENTIAL.sub(
+            CodexExecBackend._redacted_match, redacted
+        )
 
     @staticmethod
     def _redacted_match(match: re.Match[str]) -> str:

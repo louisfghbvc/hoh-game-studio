@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from hoh.policy import StopDecision
 from hoh.reporting import build_status, render_run_summary, write_run_summary
 
@@ -82,7 +84,8 @@ def test_report_contains_candidate_cost_and_resume(tmp_path: Path) -> None:
     assert "Best candidate: abc123" in rendered
     assert "Total tokens: 4200" in rendered
     assert "Remaining gaps" in rendered
-    assert "hoh resume --run-id run-42" in rendered
+    assert "hoh resume" not in rendered
+    assert "hoh run" in rendered
     assert write_run_summary(tmp_path, rendered) == tmp_path / "run-summary.md"
     assert (tmp_path / "run-summary.md").read_text(encoding="utf-8") == rendered
 
@@ -151,7 +154,7 @@ def test_invalid_run_ids_never_produce_resume_commands_or_markdown_lines() -> No
 
         status = build_status(
             state,
-            decision=StopDecision(True, "blocked", "unrecoverable protocol failure"),
+            decision={"terminal_status": "resumable", "reason": "repairable failure"},
         )
 
         rendered = render_run_summary(status)
@@ -160,6 +163,42 @@ def test_invalid_run_ids_never_produce_resume_commands_or_markdown_lines() -> No
         assert "hoh resume" not in status["guidance"]
         assert "\r" not in rendered
         assert "\nStatus: complete" not in rendered
+
+
+@pytest.mark.parametrize("terminal_status", ("running", "resumable"))
+def test_only_running_and_resumable_states_emit_resume_guidance(
+    terminal_status: str,
+) -> None:
+    state = report_fixture()
+
+    status = build_status(
+        state,
+        decision={"terminal_status": terminal_status, "reason": "continue this run"},
+    )
+
+    assert status["guidance"] == "hoh resume --run-id run-42"
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected"),
+    (
+        ("cancelled", "hoh run"),
+        ("budget_exhausted", "hoh run"),
+        ("blocked", "Manual action required:"),
+    ),
+)
+def test_terminal_noncomplete_states_never_emit_resume_guidance(
+    terminal_status: str, expected: str
+) -> None:
+    state = report_fixture()
+
+    status = build_status(
+        state,
+        decision={"terminal_status": terminal_status, "reason": "terminal stop"},
+    )
+
+    assert "hoh resume" not in status["guidance"]
+    assert expected in status["guidance"]
 
 
 def test_terminal_failure_category_comes_from_decision_not_old_diagnostics() -> None:

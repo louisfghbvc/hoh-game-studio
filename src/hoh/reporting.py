@@ -283,9 +283,23 @@ def _guidance(status: object, run_id: str | None, best_candidate: str | None) ->
         if best_candidate is None:
             return "Manual action required: complete run has no canonical merge candidate."
         return f"git merge {best_candidate}"
-    if run_id is not None and _SAFE_RUN_ID.fullmatch(run_id):
-        return f"hoh resume --run-id {run_id}"
-    return "Manual action required: run ID is not a safe resume token."
+    if status in {"running", "resumable"}:
+        if run_id is not None and _SAFE_RUN_ID.fullmatch(run_id):
+            return f"hoh resume --run-id {run_id}"
+        return "Manual action required: run ID is not a safe resume token."
+    if status == "cancelled":
+        return "Start a new run with: hoh run"
+    if status == "budget_exhausted":
+        return (
+            "Manual action required: revise the configured budget, then start "
+            "a new run with: hoh run"
+        )
+    if status == "blocked":
+        return (
+            "Manual action required: resolve the reported blocker, then start "
+            "a new run with: hoh run"
+        )
+    return "Manual action required: inspect the run status before starting a new run."
 
 
 def _candidate(run_state: Mapping[str, object], name: str) -> str | None:

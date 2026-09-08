@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from collections.abc import Mapping
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Any
 
@@ -39,6 +40,7 @@ DEFAULTS: dict[str, object] = {
     "max_elapsed_minutes": 480,
     "protected_paths": (".hoh", ".git"),
 }
+_MANDATORY_PROTECTED_PATHS = (".hoh", ".git")
 _REQUIRED_KEYS = frozenset({"adapter", "model", "reasoning_effort", *DEFAULTS})
 _ALLOWED_KEYS = _REQUIRED_KEYS | {"adapter_options"}
 _COMMAND_ADAPTER_KEYS = frozenset(
@@ -171,12 +173,55 @@ def _read_config(path: Path) -> dict[str, object]:
     return data
 
 
-def _protected_paths(value: object) -> tuple[str, ...]:
-    if not isinstance(value, list) or not value:
-        raise ConfigError("protected_paths must be a nonempty list of strings")
-    if any(not isinstance(path, str) or not path for path in value):
-        raise ConfigError("protected_paths must be a nonempty list of strings")
-    return tuple(value)
+def _protected_paths(value: object, project: Path) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(
+        not isinstance(path, str) or not path for path in value
+    ):
+        raise ConfigError("protected_paths must be a list of strings")
+
+    project_root = project.resolve()
+    canonical: list[str] = []
+    seen: set[str] = set()
+    for supplied in (*_MANDATORY_PROTECTED_PATHS, *value):
+        assert isinstance(supplied, str)
+        if (
+            "\x00" in supplied
+            or "\\" in supplied
+            or PurePosixPath(supplied).is_absolute()
+            or PureWindowsPath(supplied).is_absolute()
+            or bool(PureWindowsPath(supplied).drive)
+        ):
+            raise ConfigError(
+                f"protected_paths entries must be safe relative paths: {supplied!r}"
+            )
+        parts = tuple(part for part in supplied.split("/") if part not in {"", "."})
+        if not parts or ".." in supplied.split("/"):
+            raise ConfigError(
+                f"protected_paths entries must be safe relative paths: {supplied!r}"
+            )
+        current = project_root
+        for part in parts:
+            current = current / part
+            if current.is_symlink() or bool(
+                getattr(current, "is_junction", lambda: False)()
+            ):
+                raise ConfigError(
+                    f"protected_paths entries must not traverse aliases: {supplied!r}"
+                )
+        resolved = project_root.joinpath(*parts).resolve(strict=False)
+        try:
+            relative = resolved.relative_to(project_root)
+        except ValueError:
+            raise ConfigError(
+                f"protected_paths entries must remain inside the product: {supplied!r}"
+            ) from None
+        normalized = relative.as_posix()
+        identity = os.path.normcase(normalized)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        canonical.append(normalized)
+    return tuple(canonical)
 
 
 def load_config(project: Path) -> HarnessConfig:
@@ -227,7 +272,7 @@ def load_config(project: Path) -> HarnessConfig:
         max_elapsed_minutes=_require_positive_integer(
             data["max_elapsed_minutes"], "max_elapsed_minutes"
         ),
-        protected_paths=_protected_paths(data["protected_paths"]),
+        protected_paths=_protected_paths(data["protected_paths"], project_path),
         adapter_options=MappingProxyType(dict(adapter_options)),
     )
 

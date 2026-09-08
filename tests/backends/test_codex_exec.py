@@ -259,6 +259,29 @@ def test_process_errors_redact_quoted_and_equal_secret_values(tmp_path: Path) ->
     assert "--password '<redacted>'" in message
 
 
+def test_process_errors_redact_the_complete_authorization_bearer_value(
+    tmp_path: Path,
+) -> None:
+    """Redacting only the `Bearer` word must leave this regression failing."""
+
+    request = agent_request(tmp_path)
+    backend = executable_backend(
+        request.workspace,
+        "import sys\n"
+        'sys.stderr.write("Authorization: Bearer super-secret-token")\n'
+        "sys.exit(9)\n",
+    )
+
+    with pytest.raises(BackendProcessError) as raised:
+        backend.run(request)
+
+    message = str(raised.value)
+    assert "super-secret-token" not in message
+    assert "super-secret" not in message
+    assert "secret-token" not in message
+    assert "Authorization: <redacted>" in message
+
+
 def test_retained_events_redact_structured_secrets_without_changing_response(
     tmp_path: Path,
 ) -> None:
@@ -284,6 +307,33 @@ print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "cached
     assert "quoted secret value" not in persisted[0]["detail"]
     assert "equal-secret" not in persisted[0]["detail"]
     assert json.loads(persisted[0]["item"]["text"])["auth_token"] == "<redacted>"
+
+
+def test_retained_nested_error_json_redacts_bearer_without_overredacting_text(
+    tmp_path: Path,
+) -> None:
+    """Nested event/error strings must retain neither a full nor partial credential."""
+
+    request = agent_request(tmp_path)
+    backend = executable_backend(
+        request.workspace,
+        """import json
+response = {"status": "pass"}
+detail = "Authorization: Bearer super-secret-token"
+print(json.dumps({"type": "item.completed", "error": {"message": detail, "json": json.dumps({"Authorization": "Bearer super-secret-token"})}, "note": "The bearer of good news is ordinary text.", "item": {"type": "agent_message", "text": json.dumps(response)}}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}}))
+""",
+    )
+
+    backend.run(request)
+
+    retained = request.events_path.read_text(encoding="utf-8")
+    assert "super-secret-token" not in retained
+    assert "super-secret" not in retained
+    assert "secret-token" not in retained
+    event = json.loads(retained.splitlines()[0])
+    assert event["note"] == "The bearer of good news is ordinary text."
+    assert json.loads(event["error"]["json"])["Authorization"] == "<redacted>"
 
 
 def test_timeout_raises_distinct_error(tmp_path: Path) -> None:

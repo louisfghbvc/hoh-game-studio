@@ -67,6 +67,28 @@ class GitService:
         if status:
             raise DirtyWorktreeError(f"product worktree is dirty: {status.strip()}")
 
+    def assert_product_clean(self) -> None:
+        """Reject product dirt while ignoring only canonical host state.
+
+        ``.hoh`` is mandatory host-owned state and is validated independently
+        by protected-path snapshots.  It must not prevent a legitimate next
+        run after a terminal journal update, but no configurable product path
+        is hidden from this boundary.
+        """
+
+        status = self._run(
+            (
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                ".",
+                ":(exclude,top,literal).hoh",
+            )
+        )
+        if status:
+            raise DirtyWorktreeError(f"product worktree is dirty: {status.strip()}")
+
     def head_sha(self) -> str:
         """Return the commit currently checked out by the product worktree."""
 
@@ -76,7 +98,7 @@ class GitService:
         """Create and switch to the dedicated branch for *run_id*."""
 
         self._validate_run_id(run_id)
-        self.assert_clean()
+        self.assert_product_clean()
         branch = f"hoh/run-{run_id}"
         self._run(("switch", "-c", branch))
         return branch
@@ -199,7 +221,11 @@ class GitService:
         snapshot: dict[str, str] = {}
         for supplied_path in paths:
             relative_path, absolute_path = self._protected_path(supplied_path)
-            snapshot[relative_path] = self._recursive_digest(absolute_path)
+            snapshot[relative_path] = (
+                self._git_metadata_digest(absolute_path)
+                if relative_path == ".git"
+                else self._recursive_digest(absolute_path)
+            )
         return snapshot
 
     def assert_snapshot_unchanged(self, snapshot: Mapping[str, str]) -> None:
@@ -656,9 +682,50 @@ class GitService:
             raise ProtectedPathError("the repository root cannot be a protected path")
         return relative_path.as_posix(), absolute_path
 
+    def _git_metadata_digest(self, pointer_path: Path) -> str:
+        """Hash the checkout marker and Git's resolved private/shared metadata."""
+
+        roots: list[tuple[str, Path]] = []
+        for option in ("--git-dir", "--git-common-dir"):
+            supplied = self._run(("rev-parse", option)).strip()
+            candidate = Path(supplied)
+            if not candidate.is_absolute():
+                candidate = self._repository / candidate
+            resolved = candidate.resolve(strict=False)
+            if (
+                not resolved.is_dir()
+                or resolved == Path(resolved.anchor)
+            ):
+                raise ProtectedPathError(
+                    f"Git reported an unsafe metadata root for {option}"
+                )
+            roots.append((option, resolved))
+
+        digest = hashlib.sha256()
+
+        def add_record(*fields: bytes) -> None:
+            for field in fields:
+                digest.update(len(field).to_bytes(8, byteorder="big"))
+                digest.update(field)
+
+        add_record(b"checkout-marker", self._recursive_digest(pointer_path).encode("ascii"))
+        seen: set[Path] = set()
+        for option, root in roots:
+            if root in seen:
+                continue
+            seen.add(root)
+            add_record(
+                option.encode("ascii"),
+                os.fsencode(root),
+                self._recursive_digest(root).encode("ascii"),
+            )
+        return digest.hexdigest()
+
     @staticmethod
     def _recursive_digest(path: Path) -> str:
         digest = hashlib.sha256()
+        boundary = path.resolve(strict=False)
+        visited_directories: set[tuple[int, int]] = set()
 
         def add_record(*fields: bytes) -> None:
             for field in fields:
@@ -667,7 +734,10 @@ class GitService:
 
         def add(entry: Path, relative_name: str) -> None:
             encoded_name = relative_name.encode("utf-8", errors="surrogateescape")
-            if entry.is_symlink():
+            is_junction = bool(
+                getattr(entry, "is_junction", lambda: False)()
+            )
+            if entry.is_symlink() or is_junction:
                 target = os.readlink(entry).encode("utf-8", errors="surrogateescape")
                 add_record(b"link", encoded_name, target)
                 return
@@ -675,6 +745,17 @@ class GitService:
                 add_record(b"missing", encoded_name)
                 return
             if entry.is_dir():
+                try:
+                    entry.resolve(strict=False).relative_to(boundary)
+                except ValueError:
+                    add_record(b"directory-escape", encoded_name)
+                    return
+                stat = entry.stat(follow_symlinks=False)
+                identity = (stat.st_dev, stat.st_ino)
+                if identity in visited_directories:
+                    add_record(b"directory-cycle", encoded_name)
+                    return
+                visited_directories.add(identity)
                 add_record(b"directory-start", encoded_name)
                 for child in sorted(entry.iterdir(), key=lambda item: item.name):
                     child_name = f"{relative_name}/{child.name}" if relative_name else child.name

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from hoh.orchestrator import PreflightError, ResumeError, RoleOutputError
 from hoh.policy import StopPolicy
 from hoh.state.evidence import EvidenceBindingError
 from hoh.state.issue_ledger import IssueLedgerError
-from hoh.state.store import StateConflictError
+from hoh.state.store import RunLockedError, StateConflictError
 from hoh.vcs.git import ProtectedPathError
 
 from tests.orchestrator.helpers import (
@@ -97,6 +98,99 @@ def test_one_loop_calls_roles_in_order_and_freezes_qa(tmp_path: Path) -> None:
     assert requests[2].workspace != project
     assert result["loops_completed"] == 1
     assert (project / ".hoh" / "runs" / result["run_id"]).exists()
+
+
+def test_product_lock_covers_cleanliness_branch_creation_and_run_shell(
+    tmp_path: Path,
+) -> None:
+    """A second startup must lose at the lock before it can create branch/state."""
+
+    project = initialized_product(tmp_path)
+    first = build_services(
+        project,
+        FakeAgentBackend([]),
+        RecordingAdapter(),
+        orchestrator_options={"run_id_factory": lambda: "first"},
+    )
+    second = build_services(
+        project,
+        FakeAgentBackend([]),
+        RecordingAdapter(),
+        orchestrator_options={"run_id_factory": lambda: "second"},
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    first_errors: list[BaseException] = []
+
+    def hold_locked_drive(run_dir: Path, run_state: dict[str, object]):
+        assert (project / ".hoh" / "lock").is_file()
+        assert run_dir.name == "first"
+        assert run_state["branch"] == "hoh/run-first"
+        entered.set()
+        assert release.wait(10)
+        return dict(run_state)
+
+    first.orchestrator._drive_locked = hold_locked_drive  # type: ignore[method-assign]
+
+    def start_first() -> None:
+        try:
+            first.orchestrator.run(max_loops=1)
+        except BaseException as error:  # pragma: no cover - asserted below
+            first_errors.append(error)
+
+    thread = threading.Thread(target=start_first)
+    thread.start()
+    assert entered.wait(10)
+    try:
+        with pytest.raises(RunLockedError):
+            second.orchestrator.run(max_loops=1)
+    finally:
+        release.set()
+        thread.join(10)
+
+    assert not thread.is_alive()
+    assert first_errors == []
+    branches = run_git(project, "branch", "--format=%(refname:short)").splitlines()
+    assert sorted(branches) == ["hoh/run-first", "main"]
+    run_dirs = tuple((project / ".hoh" / "runs").iterdir())
+    assert [path.name for path in run_dirs] == ["first"]
+    state = json.loads((run_dirs[0] / "run.json").read_text(encoding="utf-8"))
+    assert state["branch"] == run_git(project, "branch", "--show-current")
+
+
+@pytest.mark.parametrize(
+    "terminal_status", ("complete", "budget_exhausted", "blocked", "cancelled")
+)
+def test_new_run_gets_past_product_cleanliness_after_terminal_host_state(
+    tmp_path: Path, terminal_status: str
+) -> None:
+    project = initialized_product(tmp_path)
+    prior = project / ".hoh" / "runs" / "prior"
+    prior.mkdir(parents=True)
+    (prior / "run.json").write_text(
+        json.dumps({"status": terminal_status}) + "\n", encoding="utf-8"
+    )
+    (prior / "run-summary.md").write_text(
+        f"Status: {terminal_status}\n", encoding="utf-8"
+    )
+    (project / ".hoh" / "issue-ledger.json").write_text(
+        '{"schema_version": 1, "issues": [], "summary": {}}\n',
+        encoding="utf-8",
+    )
+    services = build_services(
+        project,
+        FakeAgentBackend([]),
+        RecordingAdapter(),
+        orchestrator_options={"run_id_factory": lambda: f"next-{terminal_status}"},
+    )
+
+    services.orchestrator._drive_locked = (  # type: ignore[method-assign]
+        lambda run_dir, run_state: dict(run_state)
+    )
+    result = services.orchestrator.run(max_loops=1)
+
+    assert result["run_id"] == f"next-{terminal_status}"
+    assert result["branch"] == f"hoh/run-next-{terminal_status}"
 
 
 def test_authoritative_inspection_reconstructs_valid_closed_and_resumable_runs(

@@ -262,14 +262,16 @@ def test_offline_cli_runs_real_services_and_reports_structured_state(
     assert status["current_candidate"] == candidate_commit
     assert status["role_attempts"] == {"developer": 1, "planner": 1, "qa": 1}
     assert status["total_tokens"] == 69
-    assert status["guidance"] == f"hoh resume --run-id {status['run_id']}"
+    assert "hoh resume" not in status["guidance"]
+    assert "hoh run" in status["guidance"]
 
     assert cli.main(["report", "--project", str(project)]) == 0
     report_output = capsys.readouterr()
     assert report_output.err == ""
     assert "Status: budget_exhausted" in report_output.out
     assert f"Current candidate: {candidate_commit}" in report_output.out
-    assert f"hoh resume --run-id {status['run_id']}" in report_output.out
+    assert "hoh resume" not in report_output.out
+    assert "hoh run" in report_output.out
 
 
 def test_completed_offline_cli_recommends_candidate_not_evidence_commit(

@@ -7,12 +7,20 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import IO, Mapping, Sequence
 
 from hoh.adapters.base import AdapterContext
 from hoh.models import CheckBundle, CheckResult, Diagnostic
+from hoh.processes import (
+    close_pipe_descriptors,
+    join_threads,
+    process_group_options,
+    terminate_process_tree,
+    wait_after_termination,
+)
 
 
 class CommandAdapter:
@@ -124,34 +132,64 @@ class CommandAdapter:
         timed_out = False
         return_code: int | None = None
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 cwd=project,
-                check=False,
-                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=self._timeout_seconds,
+                encoding="utf-8",
+                errors="replace",
                 shell=False,
+                **process_group_options(),
             )
-            stdout = completed.stdout
-            stderr = completed.stderr
-            return_code = completed.returncode
-            status = "pass" if completed.returncode == 0 else "fail"
-            summary = (
-                "Command completed successfully"
-                if status == "pass"
-                else f"Command exited with status {completed.returncode}"
+            if process.stdout is None or process.stderr is None:
+                terminate_process_tree(process)
+                wait_after_termination(process)
+                raise OSError("could not establish command output pipes")
+            stdout_chunks: list[str] = []
+            stderr_chunks: list[str] = []
+            stdout_thread = threading.Thread(
+                target=_drain_pipe,
+                args=(process.stdout, stdout_chunks),
+                daemon=True,
             )
-            pattern = _matching_pattern(self._error_patterns, stdout, stderr)
-            if pattern is not None:
+            stderr_thread = threading.Thread(
+                target=_drain_pipe,
+                args=(process.stderr, stderr_chunks),
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+            try:
+                return_code = process.wait(timeout=self._timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                terminate_process_tree(process)
+                wait_after_termination(process)
+            finally:
+                threads = (stdout_thread, stderr_thread)
+                if not join_threads(threads):
+                    terminate_process_tree(process)
+                    close_pipe_descriptors(process)
+                    join_threads(threads, timeout=0.25)
+            stdout = "".join(stdout_chunks)
+            stderr = "".join(stderr_chunks)
+            if timed_out:
                 status = "fail"
-                summary = f"Command output matched error pattern: {pattern.pattern}"
-        except subprocess.TimeoutExpired as error:
-            timed_out = True
-            stdout = _coerce_output(error.stdout)
-            stderr = _coerce_output(error.stderr)
-            status = "fail"
-            summary = f"Command timed out after {self._timeout_seconds} seconds"
+                summary = f"Command timed out after {self._timeout_seconds} seconds"
+            else:
+                status = "pass" if return_code == 0 else "fail"
+                summary = (
+                    "Command completed successfully"
+                    if status == "pass"
+                    else f"Command exited with status {return_code}"
+                )
+                pattern = _matching_pattern(self._error_patterns, stdout, stderr)
+                if pattern is not None:
+                    status = "fail"
+                    summary = f"Command output matched error pattern: {pattern.pattern}"
         except (FileNotFoundError, OSError):
             stdout = ""
             stderr = ""
@@ -207,10 +245,17 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _coerce_output(value: str | bytes | None) -> str:
-    if isinstance(value, bytes):
-        return value.decode(errors="replace")
-    return value or ""
+def _drain_pipe(stream: IO[str], chunks: list[str]) -> None:
+    try:
+        for chunk in iter(lambda: stream.read(8192), ""):
+            chunks.append(chunk)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
 
 
 def _bundle_status(results: Sequence[CheckResult]) -> str:

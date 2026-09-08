@@ -106,6 +106,111 @@ def test_load_config_rejects_nonpositive_limits(tmp_path: Path) -> None:
         load_config(tmp_path)
 
 
+def test_protected_paths_are_canonical_and_always_include_host_roots(
+    tmp_path: Path,
+) -> None:
+    """Dropping canonical mandatory roots or retaining aliases must make this fail."""
+
+    git_init(tmp_path)
+    initialize_project(tmp_path, "command", "test-model", "high")
+    config_path = tmp_path / ".hoh" / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            'protected_paths = [".hoh", ".git"]',
+            'protected_paths = ["./secrets//nested/", "secrets/nested"]',
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_config(tmp_path).protected_paths == (
+        ".hoh",
+        ".git",
+        "secrets/nested",
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    (
+        ".",
+        "../outside",
+        "safe/../../outside",
+        "C:drive-relative",
+        r".hoh\..\product",
+    ),
+)
+def test_protected_paths_reject_escape_and_bypass_aliases(
+    tmp_path: Path, unsafe_path: str
+) -> None:
+    """Accepting traversal, drive, or alternate-separator aliases must make this fail."""
+
+    git_init(tmp_path)
+    initialize_project(tmp_path, "command", "test-model", "high")
+    config_path = tmp_path / ".hoh" / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            'protected_paths = [".hoh", ".git"]',
+            f"protected_paths = {json.dumps([unsafe_path])}",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="protected_paths"):
+        load_config(tmp_path)
+
+
+def test_protected_paths_reject_a_symlink_alias_outside_the_product(
+    tmp_path: Path,
+) -> None:
+    """A protected alias that resolves outside the product must not be accepted."""
+
+    git_init(tmp_path)
+    initialize_project(tmp_path, "command", "test-model", "high")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    alias = tmp_path / "protected-alias"
+    try:
+        alias.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+    config_path = tmp_path / ".hoh" / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            'protected_paths = [".hoh", ".git"]',
+            'protected_paths = ["protected-alias"]',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="protected_paths"):
+        load_config(tmp_path)
+
+
+def test_protected_paths_reject_a_symlink_alias_inside_the_product(
+    tmp_path: Path,
+) -> None:
+    git_init(tmp_path)
+    initialize_project(tmp_path, "command", "test-model", "high")
+    target = tmp_path / "protected-target"
+    target.mkdir()
+    alias = tmp_path / "protected-alias"
+    try:
+        alias.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this platform")
+    config_path = tmp_path / ".hoh" / "config.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            'protected_paths = [".hoh", ".git"]',
+            'protected_paths = ["protected-alias"]',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="protected_paths"):
+        load_config(tmp_path)
+
+
 def test_doctor_blocks_until_a_required_claim_exists(tmp_path: Path) -> None:
     git_init(tmp_path)
     initialize_project(tmp_path, "command", "test-model", "high")

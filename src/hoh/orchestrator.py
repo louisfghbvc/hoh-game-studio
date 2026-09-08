@@ -148,29 +148,34 @@ class HoHOrchestrator:
         """Start a new run branch and execute bounded evidence-grounded loops."""
 
         loop_limit = self._loop_limit(max_loops)
-        self.git.assert_clean()
-        start_sha = self.git.head_sha()
-        run_id = self._run_id_factory()
-        branch = self.git.create_run_branch(run_id)
-        run_dir = self.store.create_run(run_id, start_sha)
-        run_state: dict[str, object] = {
-            "schema_version": 1,
-            "run_id": run_id,
-            "start_sha": start_sha,
-            "branch": branch,
-            "status": "running",
-            "started_at": self._now().isoformat(),
-            "updated_at": self._now().isoformat(),
-            "active_loop": 1,
-            "loop_limit": loop_limit,
-            "current_candidate": None,
-            "best_candidate": None,
-            "loops": [],
-            "receipts": [],
-            "skill_receipts": [],
-        }
-        self._write_run_state(run_dir, run_state)
-        return self._drive(run_dir, run_state)
+        lock = RunLock(self.config.project / ".hoh" / "lock")
+        lock.acquire()
+        try:
+            self.git.assert_product_clean()
+            start_sha = self.git.head_sha()
+            run_id = self._run_id_factory()
+            branch = self.git.create_run_branch(run_id)
+            run_dir = self.store.create_run(run_id, start_sha)
+            run_state: dict[str, object] = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "start_sha": start_sha,
+                "branch": branch,
+                "status": "running",
+                "started_at": self._now().isoformat(),
+                "updated_at": self._now().isoformat(),
+                "active_loop": 1,
+                "loop_limit": loop_limit,
+                "current_candidate": None,
+                "best_candidate": None,
+                "loops": [],
+                "receipts": [],
+                "skill_receipts": [],
+            }
+            self._write_run_state(run_dir, run_state)
+            return self._drive_locked(run_dir, run_state)
+        finally:
+            lock.release()
 
     def resume(self, expected_run_id: str | None = None) -> dict[str, object]:
         """Continue the newest resumable run, optionally checking its identity.
@@ -463,16 +468,32 @@ class HoHOrchestrator:
             if candidate is None or manifest is None:
                 raise StateConflictError("durable QA has no candidate checks")
             payload = payloads[Phase.QA]
+            response = self._read_descriptor(payload, "response")
             evidence = self._read_descriptor(payload, "evidence")
             self._require_candidate_binding(evidence, candidate)
-            self._revalidate_normalized_evidence(
-                loop_dir, evidence, candidate, manifest
+            self._revalidate_qa_response(
+                loop_index, loop_dir, response, evidence, candidate, manifest
             )
-            release_gate = _optional_mapping(payload.get("release_gate"))
-            self._validate_release_gate(loop_dir, release_gate, candidate)
+            invocation_id = _required_text(payload, "qa_invocation_id")
+            self._validate_qa_invocation(
+                run_id, loop_index, loop_dir, invocation_id
+            )
+            release_gate: dict[str, object] = {}
+            release_gate_path = loop_dir / "release-gate.json"
+            if release_gate_path.is_file():
+                try:
+                    release_gate = _read_json(release_gate_path)
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    StateError,
+                ) as error:
+                    raise StateConflictError("durable release gate is malformed") from error
+                self._validate_release_gate(loop_dir, release_gate, candidate)
             qa = {
                 "evidence": evidence,
-                "qa_invocation_id": _required_text(payload, "qa_invocation_id"),
+                "qa_invocation_id": invocation_id,
                 "release_gate": release_gate,
             }
 
@@ -545,16 +566,6 @@ class HoHOrchestrator:
             "evidence_hashes": evidence_hashes,
             "allowed_heads": allowed_heads,
         }
-
-    def _drive(
-        self, run_dir: Path, run_state: dict[str, object]
-    ) -> dict[str, object]:
-        lock = RunLock(self.config.project / ".hoh" / "lock")
-        lock.acquire()
-        try:
-            return self._drive_locked(run_dir, run_state)
-        finally:
-            lock.release()
 
     def _drive_locked(
         self, run_dir: Path, run_state: dict[str, object]
@@ -988,17 +999,30 @@ class HoHOrchestrator:
     ) -> dict[str, object]:
         payload = self._phase_payload(run_id, loop_index, Phase.QA)
         if payload is not None:
+            response = self._read_descriptor(payload, "response")
             evidence = self._read_descriptor(payload, "evidence")
             self._require_candidate_binding(evidence, candidate)
-            self._revalidate_normalized_evidence(
-                loop_dir, evidence, candidate, manifest
+            self._revalidate_qa_response(
+                loop_index, loop_dir, response, evidence, candidate, manifest
+            )
+            invocation_id = _required_text(payload, "qa_invocation_id")
+            self._validate_qa_invocation(
+                run_id, loop_index, loop_dir, invocation_id
             )
             self.issue_ledger.apply(evidence, loop_index)
-            release_gate = _optional_mapping(payload.get("release_gate"))
-            self._validate_release_gate(loop_dir, release_gate, candidate)
+            release_gate = self._ensure_release_gate(
+                run_id,
+                loop_index,
+                loop_dir,
+                previous,
+                plan,
+                candidate,
+                evidence,
+                manifest,
+            )
             return {
                 "evidence": evidence,
-                "qa_invocation_id": _required_text(payload, "qa_invocation_id"),
+                "qa_invocation_id": invocation_id,
                 "release_gate": release_gate,
             }
         candidate_sha = _required_text(candidate, "candidate_sha")
@@ -1052,32 +1076,89 @@ class HoHOrchestrator:
             _required_text(candidate, "artifact_tree_sha256"),
             manifest,
         )
+        response_path = loop_dir / "qa-response.json"
         evidence_path = loop_dir / "evidence.json"
+        atomic_write_json(response_path, raw)
         atomic_write_json(evidence_path, normalized)
-        self.issue_ledger.apply(normalized, loop_index)
-        release_gate: dict[str, object] = {}
-        if self._ordinary_candidate_is_release_ready(normalized, manifest):
-            release_gate = self._run_release_gate(
-                run_id,
-                loop_index,
-                loop_dir,
-                previous,
-                plan,
-                candidate,
-                normalized,
-                skills,
-            )
         phase_payload: dict[str, object] = {
+            "response": self._descriptor(response_path),
             "evidence": self._descriptor(evidence_path),
             "qa_invocation_id": invocation_id,
-            "release_gate": release_gate,
         }
         self.store.complete_phase(run_id, loop_index, Phase.QA, phase_payload)
+        self._validate_qa_invocation(run_id, loop_index, loop_dir, invocation_id)
+        self.issue_ledger.apply(normalized, loop_index)
+        release_gate = self._ensure_release_gate(
+            run_id,
+            loop_index,
+            loop_dir,
+            previous,
+            plan,
+            candidate,
+            normalized,
+            manifest,
+        )
         return {
             "evidence": normalized,
             "qa_invocation_id": invocation_id,
             "release_gate": release_gate,
         }
+
+    def _validate_qa_invocation(
+        self,
+        run_id: str,
+        loop_index: int,
+        loop_dir: Path,
+        invocation_id: str,
+    ) -> None:
+        successful = [
+            receipt
+            for receipt in self._validated_role_attempts(
+                run_id, loop_index, loop_dir, Role.QA, "ordinary"
+            )
+            if receipt.get("outcome") == "success"
+        ]
+        if len(successful) != 1 or successful[0].get("invocation_id") != invocation_id:
+            raise StateConflictError(
+                "durable QA phase has a different successful invocation identity"
+            )
+
+    def _ensure_release_gate(
+        self,
+        run_id: str,
+        loop_index: int,
+        loop_dir: Path,
+        previous: list[dict[str, object]],
+        plan: dict[str, object],
+        candidate: dict[str, object],
+        ordinary_evidence: dict[str, object],
+        manifest: dict[str, object],
+    ) -> dict[str, object]:
+        """Load or produce the post-QA release gate as a separate durable record."""
+
+        gate_path = loop_dir / "release-gate.json"
+        if gate_path.is_file():
+            try:
+                gate = _read_json(gate_path)
+            except (OSError, UnicodeError, json.JSONDecodeError, StateError) as error:
+                raise StateConflictError("durable release gate is malformed") from error
+            self._validate_release_gate(loop_dir, gate, candidate)
+            return gate
+        if not self._ordinary_candidate_is_release_ready(ordinary_evidence, manifest):
+            return {}
+        gate = self._run_release_gate(
+            run_id,
+            loop_index,
+            loop_dir,
+            previous,
+            plan,
+            candidate,
+            ordinary_evidence,
+            self._qa_skills(),
+        )
+        atomic_write_json(gate_path, gate)
+        self._validate_release_gate(loop_dir, gate, candidate)
+        return gate
 
     def _ordinary_candidate_is_release_ready(
         self,
@@ -1198,7 +1279,9 @@ class HoHOrchestrator:
             artifact_tree_sha256,
             manifest,
         )
+        release_response_path = loop_dir / "release-qa-response.json"
         release_evidence_path = loop_dir / "release-evidence.json"
+        atomic_write_json(release_response_path, raw)
         atomic_write_json(release_evidence_path, normalized)
         checks_path = loop_dir / "release-checks.json"
         manifest_path = loop_dir / "release-adapter-manifest.json"
@@ -1220,6 +1303,7 @@ class HoHOrchestrator:
             "deterministic_checks_candidate_sha": candidate_sha,
             "checks": self._descriptor(checks_path),
             "manifest": self._descriptor(manifest_path),
+            "response": self._descriptor(release_response_path),
             "evidence": self._descriptor(release_evidence_path),
         }
 
@@ -1245,11 +1329,17 @@ class HoHOrchestrator:
 
         checks = self._read_descriptor(release_gate, "checks")
         manifest = self._read_descriptor(release_gate, "manifest")
+        response = self._read_descriptor(release_gate, "response")
         evidence = self._read_descriptor(release_gate, "evidence")
         for artifact in (checks, manifest, evidence):
             self._require_candidate_binding(artifact, candidate)
-        self._revalidate_normalized_evidence(
-            loop_dir, evidence, candidate, manifest
+        self._revalidate_qa_response(
+            _required_positive_int(candidate, "loop_index"),
+            loop_dir,
+            response,
+            evidence,
+            candidate,
+            manifest,
         )
         if checks.get("scope") != "full_release" or manifest.get("scope") != "full_release":
             raise StateConflictError("durable release records have the wrong scope")
@@ -1274,38 +1364,36 @@ class HoHOrchestrator:
         if release_gate.get("qa_status") != expected_qa_status:
             raise StateConflictError("durable release QA verdict conflicts with its evidence")
 
-    def _revalidate_normalized_evidence(
+    def _revalidate_qa_response(
         self,
+        loop_index: int,
         loop_dir: Path,
+        response: Mapping[str, object],
         evidence: Mapping[str, object],
         candidate: Mapping[str, object],
         manifest: Mapping[str, object],
     ) -> None:
-        """Replay Task 10 normalization to recheck cited files and host derivations."""
+        """Re-normalize a journal-bound QA response before applying side effects."""
 
-        host_metadata = evidence.get("host_metadata")
-        if not isinstance(host_metadata, Mapping) or not isinstance(
-            host_metadata.get("qa_product_complete"), bool
-        ):
+        try:
+            self._validate_schema(Role.QA, response)
+            self._validate_role_semantics(Role.QA, response, loop_index)
+        except RoleOutputError as error:
             raise StateConflictError(
-                "durable normalized evidence is missing host completion metadata"
-            )
-        reconstructed_raw = dict(evidence)
-        reconstructed_raw["product_complete"] = host_metadata["qa_product_complete"]
-        reconstructed_raw.pop("host_metadata", None)
-        reconstructed_raw.pop("diagnostics", None)
+                "durable QA response no longer satisfies its role contract"
+            ) from error
         normalizer = EvidenceNormalizer(
             loop_dir, self.config.project / ".hoh" / "requirements.json"
         )
         replayed = normalizer.normalize(
-            reconstructed_raw,
+            dict(response),
             _required_text(candidate, "candidate_sha"),
             _required_text(candidate, "artifact_tree_sha256"),
             manifest,
         )
         if replayed != dict(evidence):
             raise StateConflictError(
-                "durable normalized evidence no longer matches host derivation"
+                "durable QA response does not match its normalized evidence"
             )
 
     def _ensure_closure(
@@ -2779,6 +2867,7 @@ class HoHOrchestrator:
             "baseline-checks.json",
             "checks.json",
             "adapter-manifest.json",
+            "qa-response.json",
             "evidence.json",
             "receipt.json",
             "loop-record.json",
@@ -2792,8 +2881,10 @@ class HoHOrchestrator:
         if release_gate:
             release_manifest = self._read_descriptor(release_gate, "manifest")
             for name in (
+                "release-gate.json",
                 "release-checks.json",
                 "release-adapter-manifest.json",
+                "release-qa-response.json",
                 "release-evidence.json",
             ):
                 selected.append(

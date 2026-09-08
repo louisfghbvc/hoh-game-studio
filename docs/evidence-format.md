@@ -177,8 +177,11 @@ Valid ordinary-check example:
 
 A release result is not interchangeable with the ordinary candidate check.
 
-The QA phase journal also retains a `release_gate` object with every field
-below when the separate gate runs:
+The QA phase journal binds descriptors for both `qa-response.json` and the
+normalized `evidence.json`, plus the ordinary QA invocation ID. The host
+completes that phase before applying evidence to the issue ledger or starting
+the release gate. When the separate gate runs, its result is atomically stored
+in `release-gate.json` with every field below:
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -193,7 +196,13 @@ below when the separate gate runs:
 | `deterministic_checks_candidate_sha` | Git commit SHA | Explicit candidate binding for the checks. |
 | `checks` | descriptor object | Project-relative `path` and file `sha256` for `release-checks.json`. |
 | `manifest` | descriptor object | Project-relative `path` and file `sha256` for `release-adapter-manifest.json`. |
+| `response` | descriptor object | Project-relative `path` and file `sha256` for `release-qa-response.json`. |
 | `evidence` | descriptor object | Project-relative `path` and file `sha256` for `release-evidence.json`. |
+
+Resume revalidates the phase-bound raw QA response and re-normalizes it against
+the same candidate, tree, manifest, and cited hashes before applying the issue
+ledger idempotently. A journaled QA phase therefore never requires reinvoking
+ordinary QA after a crash at the ledger boundary.
 
 For command checks, each `command-NNNN.json` record has `command` (the exact
 argument array), `return_code` (integer or null), ISO-8601 `started_at` and
@@ -623,7 +632,7 @@ replay. The base status has every field below:
 | `failures` | array | Infrastructure/protocol diagnostics and/or terminal failure reason records. |
 | `failure_category` | `infrastructure`, `protocol`, or null | Terminal classified failure when present. |
 | `skills` | array of skill receipts | Unique `skill_id`, `version`, and `sha256` identities observed in receipts. |
-| `guidance` | string | Exact safe `hoh resume --run-id ...`, candidate `git merge ...`, or manual-action text. |
+| `guidance` | string | Exact safe `hoh resume --run-id ...` only for running/resumable state, candidate `git merge ...` only for a completion-bound candidate, or executable new-run/manual-action text for terminal non-complete states. |
 
 `resumable` denotes a validated, repairable failure that interrupted the run.
 Authoritative inspection reconstructs it only when the durable aggregate and
@@ -633,7 +642,9 @@ external structured failure record agree and the failure has
 run without a terminal closure), `cancelled` (a user-cancelled, non-resumable
 outcome), `blocked` (a non-resumable failure or bounded policy stop described
 below), `complete` (the release gate passed), and `budget_exhausted` (a
-resource/loop-budget closure).
+resource/loop-budget closure). Cancelled runs direct the operator to `hoh run`;
+blocked and budget-exhausted runs require the stated manual remediation before
+starting a new run and never advertise `hoh resume`.
 
 `blocked` has two classes of source. It records either a validated
 unrecoverable `infrastructure` or `protocol` failure, or a bounded policy stop
@@ -730,7 +741,7 @@ Valid CLI JSON example:
       "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
     }
   ],
-  "guidance": "hoh resume --run-id 20260908T010203Z-0123456789ab",
+  "guidance": "Manual action required: revise the configured budget, then start a new run with: hoh run",
   "status": "budget_exhausted",
   "loops_completed": 1
 }

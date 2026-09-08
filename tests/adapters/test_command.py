@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -47,6 +51,39 @@ def test_timeout_is_failure_not_pass(tmp_path: Path) -> None:
     )
 
     assert adapter.check(_context(tmp_path), {}).status == "fail"
+
+
+def test_timeout_terminates_descendant_and_returns_before_child_lifetime(
+    tmp_path: Path,
+) -> None:
+    """Killing only the configured parent must leave inherited pipes blocking."""
+
+    child_pid_path = tmp_path / "child.pid"
+    command = (
+        sys.executable,
+        "-c",
+        "import subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(4)'], "
+        "stdout=sys.stdout, stderr=sys.stderr); "
+        f"open({json.dumps(str(child_pid_path))}, 'w', encoding='utf-8').write(str(child.pid)); "
+        "time.sleep(4)",
+    )
+    adapter = CommandAdapter(checks=(command,), timeout_seconds=1)
+
+    started = time.monotonic()
+    bundle = adapter.check(_context(tmp_path), {})
+    elapsed = time.monotonic() - started
+
+    assert bundle.status == "fail"
+    assert elapsed < 3.5
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    assert _wait_until_process_exits(child_pid)
+    metadata = json.loads(
+        (_context(tmp_path).output / "checks" / "command-0001.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["timed_out"] is True
 
 
 def test_missing_required_artifact_fails_candidate(tmp_path: Path) -> None:
@@ -195,3 +232,29 @@ def _run_git(project: Path, *arguments: str) -> str:
 
 def _context(project: Path) -> AdapterContext:
     return AdapterContext(project, project.parent / f"{project.name}-host-output")
+
+
+def _wait_until_process_exits(pid: int) -> bool:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not _process_exists(pid):
+            return True
+        time.sleep(0.05)
+    return not _process_exists(pid)
+
+
+def _process_exists(pid: int) -> bool:
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            check=False,
+            capture_output=True,
+            text=True,
+            shell=False,
+        )
+        return f'"{pid}"' in completed.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True

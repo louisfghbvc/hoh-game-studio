@@ -41,6 +41,62 @@ def test_resume_does_not_repeat_completed_developer(tmp_path: Path) -> None:
     assert not any((project / ".hoh" / "tmp").glob("qa-*"))
 
 
+def test_resume_after_ledger_apply_uses_phase_bound_qa_evidence_without_reinvoking(
+    tmp_path: Path,
+) -> None:
+    """Journaling QA after ledger mutation must make this crash window fail."""
+
+    project, services = orchestrator_fixture(tmp_path)
+    ledger = services.orchestrator.issue_ledger
+    apply = ledger.apply
+    crashed = False
+
+    def apply_then_crash(evidence, loop_index):
+        nonlocal crashed
+        result = apply(evidence, loop_index)
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash immediately after ledger apply")
+        return result
+
+    ledger.apply = apply_then_crash  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="immediately after ledger apply"):
+        services.orchestrator.run(max_loops=1)
+    ledger.apply = apply  # type: ignore[method-assign]
+
+    run_dir = next((project / ".hoh" / "runs").iterdir())
+    loop_dir = run_dir / "loops" / "loop-0001"
+    phase_path = loop_dir / "phase-state.json"
+    phase_bytes = phase_path.read_bytes()
+    phase = json.loads(phase_bytes)
+    qa_payload = phase["completed"]["qa"]["payload"]
+    assert qa_payload["qa_invocation_id"].endswith(":qa:ordinary:attempt-01")
+    assert set(qa_payload) >= {"response", "evidence", "qa_invocation_id"}
+    candidate_sha = services.git.head_sha()
+    services.backend.requests.clear()
+    phase["completed"]["qa"]["payload"]["qa_invocation_id"] = "different-qa"
+    phase_path.write_text(json.dumps(phase) + "\n", encoding="utf-8")
+    with pytest.raises(StateConflictError, match="invocation identity"):
+        services.orchestrator.inspect_latest()
+    assert services.backend.requests == []
+    phase_path.write_bytes(phase_bytes)
+    response_path = project.joinpath(*Path(qa_payload["response"]["path"]).parts)
+    response_bytes = response_path.read_bytes()
+    response_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(StateConflictError, match="response|artifact"):
+        services.orchestrator.inspect_latest()
+    assert services.backend.requests == []
+    response_path.write_bytes(response_bytes)
+
+    result = services.orchestrator.resume()
+
+    assert services.backend.requests == []
+    assert result["current_candidate"] == candidate_sha
+    assert services.orchestrator.inspect_latest()[1]["completed_loops"] == 1
+    ledger_document = ledger.load()
+    assert len(ledger_document["applications"]) == 1
+
+
 def test_expected_resume_id_is_checked_inside_the_product_lock_before_side_effects(
     tmp_path: Path,
 ) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -44,6 +45,51 @@ def test_assert_clean_rejects_untracked_product_content(tmp_path: Path) -> None:
 
     with pytest.raises(DirtyWorktreeError, match="untracked.txt"):
         GitService(repo).assert_clean()
+
+
+@pytest.mark.parametrize(
+    "terminal_status", ("complete", "budget_exhausted", "blocked", "cancelled")
+)
+def test_product_clean_ignores_only_mandatory_terminal_host_state(
+    tmp_path: Path, terminal_status: str
+) -> None:
+    """Terminal `.hoh` journals must not hide or create product dirt."""
+
+    repo = initialized_repo(tmp_path)
+    state = repo / ".hoh"
+    state.mkdir()
+    (state / "issue-ledger.json").write_text(
+        '{"schema_version": 1, "issues": []}\n', encoding="utf-8"
+    )
+    run_git(repo, "add", ".hoh")
+    run_git(
+        repo,
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-m",
+        "add host state",
+    )
+    run_dir = state / "runs" / f"run-{terminal_status}"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps({"status": terminal_status}) + "\n", encoding="utf-8"
+    )
+    (run_dir / "run-summary.md").write_text(
+        f"Status: {terminal_status}\n", encoding="utf-8"
+    )
+    (state / "issue-ledger.json").write_text(
+        '{"schema_version": 2, "issues": []}\n', encoding="utf-8"
+    )
+
+    git = GitService(repo)
+    git.assert_product_clean()
+
+    (repo / "product.txt").write_text("dirty product", encoding="utf-8")
+    with pytest.raises(DirtyWorktreeError, match="product.txt"):
+        git.assert_product_clean()
 
 
 def test_create_run_branch_uses_the_dedicated_namespace(tmp_path: Path) -> None:
@@ -309,6 +355,44 @@ def test_protected_snapshot_records_cannot_be_absorbed_into_file_content(
     (protected / "b").unlink()
 
     with pytest.raises(ProtectedPathError, match="protected"):
+        git.assert_snapshot_unchanged(snapshot)
+
+
+def test_protected_snapshot_detects_normal_repository_git_metadata_changes(
+    tmp_path: Path,
+) -> None:
+    """Stopping `.git` recursion in a normal checkout must make this fail."""
+
+    repo = initialized_repo(tmp_path)
+    git = GitService(repo)
+    snapshot = git.snapshot_paths((".git",))
+    (repo / ".git" / "hoh-normal-probe").write_text("changed", encoding="utf-8")
+
+    with pytest.raises(ProtectedPathError, match=r"\.git"):
+        git.assert_snapshot_unchanged(snapshot)
+
+
+@pytest.mark.parametrize("metadata_root", ("--git-dir", "--git-common-dir"))
+def test_protected_snapshot_detects_linked_worktree_git_metadata_changes(
+    tmp_path: Path, metadata_root: str
+) -> None:
+    """Hashing only a linked worktree's `.git` pointer must make this fail."""
+
+    repo = initialized_repo(tmp_path)
+    linked = tmp_path / "linked"
+    run_git(repo, "worktree", "add", "-b", "linked-fixture", str(linked))
+    git = GitService(linked)
+    snapshot = git.snapshot_paths((".git",))
+    supplied = run_git(linked, "rev-parse", metadata_root)
+    metadata = Path(supplied)
+    if not metadata.is_absolute():
+        metadata = linked / metadata
+    metadata = metadata.resolve()
+    (metadata / f"hoh-{metadata_root[2:]}-probe").write_text(
+        "changed", encoding="utf-8"
+    )
+
+    with pytest.raises(ProtectedPathError, match=r"\.git"):
         git.assert_snapshot_unchanged(snapshot)
 
 
