@@ -13,7 +13,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from jsonschema import Draft202012Validator
@@ -131,7 +131,7 @@ class HoHOrchestrator:
             self.config.project / ".hoh" / "issue-ledger.json"
         )
         self._run_id_factory = run_id_factory or self._default_run_id
-        self._now = now or (lambda: datetime.now(UTC))
+        self._now = now or (lambda: datetime.now(timezone.utc))
         self._monotonic = monotonic or time.monotonic
         self._qa_worktree_factory = qa_worktree_factory or QaWorktree
         repository_key = hashlib.sha256(
@@ -2826,9 +2826,9 @@ class HoHOrchestrator:
             / "tmp"
             / f"qa-{run_id}-loop-{loop_index:04d}-{uuid.uuid4().hex[:8]}",
         )
-        frozen = worktree.create(candidate_sha)
         body_error: BaseException | None = None
         try:
+            frozen = worktree.create(candidate_sha)
             if self.git.rev_parse_in(frozen, "HEAD") != candidate_sha:
                 raise ResumeError("QA worktree is not bound to the durable candidate")
             if self.git.current_branch_in(frozen):
@@ -4022,7 +4022,7 @@ class HoHOrchestrator:
 
     @staticmethod
     def _default_run_id() -> str:
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         return f"{stamp}-{uuid.uuid4().hex[:12]}"
 
 

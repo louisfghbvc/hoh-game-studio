@@ -1,7 +1,7 @@
 import asyncio
 import json
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -19,7 +19,7 @@ from hoh.policy import StopPolicy
 from hoh.state.evidence import EvidenceBindingError
 from hoh.state.issue_ledger import IssueLedgerError
 from hoh.state.store import RunLockedError, StateConflictError
-from hoh.vcs.git import ProtectedPathError
+from hoh.vcs.git import GitError, ProtectedPathError
 
 from tests.orchestrator.helpers import (
     BlockedAdapter,
@@ -42,7 +42,7 @@ from tests.orchestrator.helpers import (
 class MutableClock:
     def __init__(self) -> None:
         self.elapsed = 0.0
-        self.epoch = datetime(2026, 1, 1, tzinfo=UTC)
+        self.epoch = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
     def monotonic(self) -> float:
         return self.elapsed
@@ -52,6 +52,41 @@ class MutableClock:
 
     def advance(self, seconds: float) -> None:
         self.elapsed += seconds
+
+
+def test_frozen_candidate_retries_cleanup_after_partial_create_failure(
+    tmp_path: Path,
+) -> None:
+    """A failed create must still enter the orchestrator's cleanup boundary."""
+
+    project = initialized_product(tmp_path)
+
+    class PartialWorktree:
+        removed = False
+
+        def create(self, candidate_sha: str) -> Path:
+            del candidate_sha
+            raise GitError("simulated partial create failure")
+
+        def remove(self) -> None:
+            self.removed = True
+
+    partial = PartialWorktree()
+    services = build_services(
+        project,
+        FakeAgentBackend([]),
+        RecordingAdapter(),
+        orchestrator_options={
+            "qa_worktree_factory": lambda git, path: partial,
+        },
+    )
+
+    with pytest.raises(GitError, match="partial create"):
+        services.orchestrator._with_frozen_candidate(
+            "run-partial", 1, services.git.head_sha(), lambda frozen: frozen
+        )
+
+    assert partial.removed is True
 
 
 class RecordingPolicy:
